@@ -21,6 +21,7 @@ def run_experiments(
     max_instances_per_group: int = None,
     time_limit_seconds: int = 300,
     verbose: bool = True,
+    allowed_n_loans: tuple[int, ...] = (4, 8),
 ) -> List[ComparisonResult]:
     """
     Run experiments on all instances.
@@ -30,6 +31,7 @@ def run_experiments(
         max_instances_per_group: Maximum instances to process per group (None = all)
         time_limit_seconds: Time limit for MILP solver
         verbose: Print progress
+        allowed_n_loans: Process only instances with these loan counts
     
     Returns:
         List of ComparisonResult objects
@@ -48,7 +50,7 @@ def run_experiments(
     results = []
     
     # Process each group
-    for n_loans in [4, 8, 12]:
+    for n_loans in allowed_n_loans:
         group_instances = grouped.get(n_loans, [])
         
         if not group_instances:
@@ -113,9 +115,10 @@ def main():
     # Remove max_instances_per_group to run on all 550 instances
     results = run_experiments(
         dataset_path=dataset_path,
-        max_instances_per_group=10,  # Set to None for full dataset
+        max_instances_per_group=30,  # Set to None for full dataset
         time_limit_seconds=300,
         verbose=True,
+        allowed_n_loans=(4, 8, 12),
     )
     
     # Print summary

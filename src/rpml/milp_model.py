@@ -53,8 +53,8 @@ class RPMLModel:
         self.instance = instance
         self.time_limit = time_limit_seconds
         
-        # Big-M constant for big-M constraints
-        self.M = 1e6
+        # Big-M constant for big-M constraints (aligned with dataset prohibition flag)
+        self.M = 1e12
         
         # Solver initialization
         self.solver = pywraplp.Solver.CreateSolver('HIGHS')
@@ -86,6 +86,7 @@ class RPMLModel:
         self.C = {}
         self.P = {}
         self.Y = {}
+        self.O = {}
         
         for j in range(n):
             for t in range(T):
@@ -95,29 +96,36 @@ class RPMLModel:
                 self.C[j, t] = self.solver.NumVar(0, self.solver.infinity(), f'C_{j}_{t}')
                 self.P[j, t] = self.solver.NumVar(0, self.solver.infinity(), f'P_{j}_{t}')
                 self.Y[j, t] = self.solver.IntVar(0, 1, f'Y_{j}_{t}')
+                self.O[j, t] = self.solver.NumVar(0, self.solver.infinity(), f'O_{j}_{t}')  # overpayment amount
         
         for t in range(T):
             self.S[t] = self.solver.NumVar(0, self.solver.infinity(), f'S_{t}')
         
-        # Objective: minimize total payments
+        # Objective: minimize total payments (penalties increase balance, not objective)
         objective = self.solver.Objective()
         for j in range(n):
             for t in range(T):
                 objective.SetCoefficient(self.X[j, t], 1.0)
+                objective.SetCoefficient(self.C[j, t], 1.0)
+                objective.SetCoefficient(self.P[j, t], 1.0)
         objective.SetMinimization()
         
         # Constraint 1: Budget constraints
-        # sum_j(X[j,0]) + S[0] <= monthly_income[0]
+        # Cash each month cannot exceed income plus previous savings (<= form as в статье)
         budget_0 = self.solver.Constraint(-self.solver.infinity(), self.instance.monthly_income[0])
         for j in range(n):
             budget_0.SetCoefficient(self.X[j, 0], 1.0)
+            budget_0.SetCoefficient(self.C[j, 0], 1.0)
+            budget_0.SetCoefficient(self.P[j, 0], 1.0)
         budget_0.SetCoefficient(self.S[0], 1.0)
         
-        # sum_j(X[j,t]) + S[t] <= monthly_income[t] + S[t-1] for t >= 1
+        # sum_j(X+C+P) + S[t] <= monthly_income[t] + S[t-1] for t >= 1
         for t in range(1, T):
             budget = self.solver.Constraint(-self.solver.infinity(), self.instance.monthly_income[t])
             for j in range(n):
                 budget.SetCoefficient(self.X[j, t], 1.0)
+                budget.SetCoefficient(self.C[j, t], 1.0)
+                budget.SetCoefficient(self.P[j, t], 1.0)
             budget.SetCoefficient(self.S[t], 1.0)
             budget.SetCoefficient(self.S[t-1], -1.0)
         
@@ -125,7 +133,16 @@ class RPMLModel:
         for j in range(n):
             r_j = self.instance.release_time[j]
             
-            # Initial balance: B[j, r_j] = principal[j]
+            # Force inactivity before release
+            for t in range(r_j):
+                inactive = self.solver.Constraint(0, 0)
+                inactive.SetCoefficient(self.Z[j, t], 1.0)
+                inactive_balance = self.solver.Constraint(0, 0)
+                inactive_balance.SetCoefficient(self.B[j, t], 1.0)
+                inactive_payment = self.solver.Constraint(0, 0)
+                inactive_payment.SetCoefficient(self.X[j, t], 1.0)
+            
+            # Initial balance at release: B[j, r_j] = principal[j]
             init_balance = self.solver.Constraint(self.instance.principals[j], self.instance.principals[j])
             init_balance.SetCoefficient(self.B[j, r_j], 1.0)
             
@@ -136,8 +153,12 @@ class RPMLModel:
                 balance_eq.SetCoefficient(self.B[j, t], 1.0)
                 balance_eq.SetCoefficient(self.B[j, t-1], -(1.0 + i_jt))
                 balance_eq.SetCoefficient(self.X[j, t], 1.0)
-                balance_eq.SetCoefficient(self.C[j, t], -1.0)
-                balance_eq.SetCoefficient(self.P[j, t], -1.0)
+                balance_eq.SetCoefficient(self.C[j, t], 1.0)
+                
+                # Cap payment by outstanding balance with interest
+                max_payment = self.solver.Constraint(-self.solver.infinity(), 0)
+                max_payment.SetCoefficient(self.X[j, t], 1.0)
+                max_payment.SetCoefficient(self.B[j, t-1], -(1.0 + i_jt))
         
         # Constraint 3: Loan activity (big-M)
         # B[j,t] <= M * Z[j,t]
@@ -146,20 +167,29 @@ class RPMLModel:
                 activity = self.solver.Constraint(-self.solver.infinity(), 0)
                 activity.SetCoefficient(self.B[j, t], 1.0)
                 activity.SetCoefficient(self.Z[j, t], -self.M)
+                # Payments only when active
+                active_pay = self.solver.Constraint(-self.solver.infinity(), 0)
+                active_pay.SetCoefficient(self.X[j, t], 1.0)
+                active_pay.SetCoefficient(self.Z[j, t], -self.M)
+                # Monotonicity of activity: once inactive stays inactive
+                if t > 0:
+                    monotone = self.solver.Constraint(0, self.solver.infinity())
+                    monotone.SetCoefficient(self.Z[j, t-1], 1.0)
+                    monotone.SetCoefficient(self.Z[j, t], -1.0)
         
         # Constraint 4: Minimum payment requirement
         # If loan is active (Z[j,t] = 1), payment must be at least min_payment_pct[j] * B[j,t-1]
-        # X[j,t] >= min_payment_pct[j] * B[j,t-1] * Z[j,t]
-        # Linearized: X[j,t] >= min_payment_pct[j] * (B[j,t-1] - M*(1-Z[j,t]))
+        # X[j,t] >= min_payment_pct[j] * B[j,t-1] - M*(1 - Z[j,t])
         for j in range(n):
             r_j = self.instance.release_time[j]
             min_pct = self.instance.min_payment_pct[j]
             
             for t in range(r_j + 1, self.instance.T):
-                min_payment = self.solver.Constraint(-self.solver.infinity(), self.M * min_pct)
+                # X - min_pct*B + M*(1 - Z) >= 0
+                min_payment = self.solver.Constraint(0, self.solver.infinity())
                 min_payment.SetCoefficient(self.X[j, t], 1.0)
                 min_payment.SetCoefficient(self.B[j, t-1], -min_pct)
-                min_payment.SetCoefficient(self.Z[j, t], -self.M * min_pct)
+                min_payment.SetCoefficient(self.Z[j, t], self.M)
         
         # Constraint 5: Underpayment penalty
         # C[j,t] >= (min_payment - X[j,t]) * (1 + default_rate) * Z[j,t]
@@ -172,45 +202,42 @@ class RPMLModel:
                 h_jt = self.instance.default_rates[j, t]
                 penalty_mult = 1.0 + h_jt
                 
-                # Linearized: C[j,t] >= penalty_mult * (min_pct * B[j,t-1] - X[j,t]) - M*(1-Z[j,t])
+                # C >= penalty_mult * (min_pct * B - X) - M*penalty_mult*(1 - Z)
                 underpayment = self.solver.Constraint(-self.M * penalty_mult, self.solver.infinity())
                 underpayment.SetCoefficient(self.C[j, t], 1.0)
-                underpayment.SetCoefficient(self.B[j, t-1], -min_pct * penalty_mult)
-                underpayment.SetCoefficient(self.X[j, t], penalty_mult)
-                underpayment.SetCoefficient(self.Z[j, t], -self.M * penalty_mult)
+                underpayment.SetCoefficient(self.B[j, t-1], penalty_mult * min_pct)
+                underpayment.SetCoefficient(self.X[j, t], -penalty_mult)
+                underpayment.SetCoefficient(self.Z[j, t], self.M * penalty_mult)
         
-        # Constraint 6: Overpayment penalty and indicator
-        # If X[j,t] > stipulated_amount[j], then P[j,t] = prepay_penalty[j] * Y[j,t]
-        # Linearized with big-M:
-        # X[j,t] <= stipulated_amount[j] + M * Y[j,t]
-        # P[j,t] >= prepay_penalty[j] * Y[j,t]
-        # P[j,t] <= prepay_penalty[j] * Y[j,t] + M * (1 - Y[j,t])
+        # Constraint 6: Overpayment handling
+        # Fixed penalty for exceeding stipulated amount, per original формулировке
         for j in range(n):
-            if not self.instance.is_prepayment_allowed(j):
-                # If prepayment prohibited, enforce X[j,t] <= stipulated_amount[j]
-                for t in range(self.instance.T):
-                    no_prepay = self.solver.Constraint(-self.solver.infinity(), self.instance.stipulated_amount[j])
-                    no_prepay.SetCoefficient(self.X[j, t], 1.0)
-            else:
-                # Allow prepayment with penalty
-                prepay_penalty = self.instance.prepay_penalty[j]
-                stipulated = self.instance.stipulated_amount[j]
+            prepay_penalty = self.instance.prepay_penalty[j]
+            stipulated = self.instance.stipulated_amount[j]
+            
+            for t in range(self.instance.T):
+                # Link overpayment indicator Y
+                overpay_cap = self.solver.Constraint(-self.solver.infinity(), stipulated + self.M)
+                overpay_cap.SetCoefficient(self.X[j, t], 1.0)
+                overpay_cap.SetCoefficient(self.Y[j, t], -self.M)
                 
-                for t in range(self.instance.T):
-                    # X[j,t] <= stipulated + M * Y[j,t]
-                    overpayment_indicator = self.solver.Constraint(-self.solver.infinity(), stipulated + self.M)
-                    overpayment_indicator.SetCoefficient(self.X[j, t], 1.0)
-                    overpayment_indicator.SetCoefficient(self.Y[j, t], -self.M)
-                    
-                    # P[j,t] >= prepay_penalty * Y[j,t]
-                    penalty_lower = self.solver.Constraint(-self.solver.infinity(), 0)
-                    penalty_lower.SetCoefficient(self.P[j, t], 1.0)
-                    penalty_lower.SetCoefficient(self.Y[j, t], -prepay_penalty)
-                    
-                    # P[j,t] <= prepay_penalty * Y[j,t] + M * (1 - Y[j,t])
-                    penalty_upper = self.solver.Constraint(-self.M, prepay_penalty)
-                    penalty_upper.SetCoefficient(self.P[j, t], 1.0)
-                    penalty_upper.SetCoefficient(self.Y[j, t], -prepay_penalty)
+                overpay_floor = self.solver.Constraint(stipulated - self.M, self.solver.infinity())
+                overpay_floor.SetCoefficient(self.X[j, t], 1.0)
+                overpay_floor.SetCoefficient(self.Y[j, t], -self.M)
+                
+                # Penalty is fixed when Y=1
+                penalty_lb = self.solver.Constraint(0, self.solver.infinity())
+                penalty_lb.SetCoefficient(self.P[j, t], 1.0)
+                penalty_lb.SetCoefficient(self.Y[j, t], -prepay_penalty)
+                
+                penalty_ub = self.solver.Constraint(-self.solver.infinity(), 0)
+                penalty_ub.SetCoefficient(self.P[j, t], 1.0)
+                penalty_ub.SetCoefficient(self.Y[j, t], -prepay_penalty)
+                
+                # Penalty only if active
+                penalty_active = self.solver.Constraint(-self.solver.infinity(), 0)
+                penalty_active.SetCoefficient(self.P[j, t], 1.0)
+                penalty_active.SetCoefficient(self.Z[j, t], -self.M)
         
         # Constraint 7: Final balance must be zero
         # B[j, T-1] = 0 for all j
