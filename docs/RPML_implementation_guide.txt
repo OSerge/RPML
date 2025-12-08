@@ -1,0 +1,135 @@
+
+РЕАЛИЗАЦИЯ ПЕРВОЙ ГИПОТЕЗЫ: RPML подход (Rios-Solis 2017)
+============================================================
+
+## ШАГ 1: Загрузка и подготовка датасета
+- Источник: https://doi.org/10.6084/m9.figshare.4823518.v1
+- Содержит: 550 instances (4, 8, 12 loans)
+- Параметры: principal, interest rates, default rates, min payments, etc.
+- Форматы: CSV или JSON для каждого instance
+
+## ШАГ 2: Реализация MILP модели Rios-Solis
+
+### Переменные решения:
+- X_jt: платёж по кредиту j в месяц t
+- B_jt: баланс долга j в месяц t
+- Z_jt: бинарная переменная (долг активен в месяц t или нет)
+- Y_jt: бинарная переменная (переплата выше лимита)
+- C_jt: штрафы за неполный платёж
+- P_jt: штрафы за переплату
+- S_t: сбережения в месяц t
+
+### Целевая функция:
+Минимизировать: sum(X_jt) для всех j, t
+
+### Ограничения (MILP):
+1. Бюджетные ограничения (4)-(5):
+   sum(X_jt) + S_t ≤ f_t + S_{t-1}
+
+2. Амортизационное условие (6):
+   sum_t[(C_jt + P_jt - X_jt) * ∏(1+i_jt')] + m_j * ∏(1+i_jt) = 0
+
+3. Динамика баланса (7)-(8):
+   B_jt = B_j{t-1}(1+i_jt) - X_jt + C_jt + P_jt
+
+4. Активность долга (9):
+   B_jt - M(1-Z_jt) ≤ 0
+
+5. Штрафы за недоплату (10)-(11):
+   Если X_jt < min_payment: C_jt = (min - X_jt)(1 + h_jt)
+
+6. Штрафы за переплату (12):
+   Если X_jt > E_jt: P_jt = pc_j * Y_jt
+
+## ШАГ 3: Решение с помощью Gurobi
+
+```python
+import gurobipy as gp
+from gurobipy import GRB, quicksum
+
+def solve_rpml(loans_data, monthly_income, T=120):
+    model = gp.Model("RPML")
+
+    # Параметры экземпляра
+    n = len(loans_data)  # количество кредитов
+
+    # Переменные решения
+    X = model.addVars(n, T, lb=0, name="X")  # платежи
+    Z = model.addVars(n, T, vtype=GRB.BINARY, name="Z")  # активность долга
+    Y = model.addVars(n, T, vtype=GRB.BINARY, name="Y")  # переплата
+    B = model.addVars(n, T, lb=0, name="B")  # баланс
+    C = model.addVars(n, T, lb=0, name="C")  # штраф за недоплату
+    P = model.addVars(n, T, lb=0, name="P")  # штраф за переплату
+    S = model.addVars(T, lb=0, name="S")  # сбережения
+
+    # Целевая функция: минимизировать сумму всех платежей
+    model.setObjective(
+        quicksum(X[j,t] for j in range(n) for t in range(T)),
+        GRB.MINIMIZE
+    )
+
+    # Ограничения бюджета
+    model.addConstr(quicksum(X[j,0] for j in range(n)) + S[0] <= monthly_income[0])
+    for t in range(1, T):
+        model.addConstr(
+            quicksum(X[j,t] for j in range(n)) + S[t] <= monthly_income[t] + S[t-1]
+        )
+
+    # Ограничения амортизации (упрощённая форма)
+    for j in range(n):
+        # Начальный баланс
+        r_j = loans_data[j]['release_time']
+        m_j = loans_data[j]['principal']
+        B[j, r_j].Start = m_j
+
+        # Динамика баланса
+        for t in range(r_j + 1, T):
+            i_jt = loans_data[j]['interest_rate']
+            model.addConstr(
+                B[j, t] == B[j, t-1] * (1 + i_jt) - X[j, t] + C[j, t] + P[j, t]
+            )
+
+    # Активность долга
+    M = 1e6
+    for j in range(n):
+        for t in range(1, T):
+            model.addConstr(B[j, t] <= M * Z[j, t])
+
+    # Штраф за недоплату
+    for j in range(n):
+        min_pmt = loans_data[j].get('min_payment', 0)
+        h_j = loans_data[j]['default_rate']
+        for t in range(1, T):
+            model.addConstr(
+                C[j, t] >= (min_pmt - X[j, t]) * (1 + h_j) * Z[j, t]
+            )
+
+    # Оптимизация
+    model.optimize()
+
+    return model, X, Z, B, C, P, S
+```
+
+## ШАГ 4: Сравнение с базовыми стратегиями
+
+Baseline алгоритмы для сравнения:
+1. Debt Avalanche (максимальная ставка первой)
+2. Debt Snowball (минимальный баланс первой)
+3. Debt Average (средняя ставка)
+
+## ШАГ 5: Метрики оценки
+
+- Relative Savings (%) = (Cost_baseline - Cost_RPML) / Cost_baseline * 100
+- Gap = (ObjBound - ObjVal) / ObjVal * 100 (из Gurobi)
+- Time to solve (секунды)
+- Количество месяцев до полного погашения
+
+## ОЖИДАЕМЫЕ РЕЗУЛЬТАТЫ:
+
+На датасете Rios-Solis (550 instances):
+- 4 кредита: ~5.84% экономия vs Debt Avalanche
+- 8 кредитов: ~4.62% экономия
+- 12 кредитов: ~3.43% экономия
+- Среднее: 4.61% экономия
+
+В лучшем случае: 40% экономия!

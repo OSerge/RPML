@@ -1,0 +1,19 @@
+How to read the instances. 
+
+Number of loans=n
+Horizon T
+Number of cars
+Number of houses
+Number of credit cards
+Number of bank loans
+Vector (n) with the principal of all the loans
+Matrix of (n x T) with the interest rates
+Matrix of (n x T) with the default interest rates
+Vector (n) with the percentage of the loan used to compute the minimum payment
+Vector (n) with the penalization for paying more than the stipulated
+Vector (T) with the amount of money that the loaner has per month for paying his debts
+Vector (n) with the realize date of the debts
+Vector (n) with the stipulated amount for each debt
+
+
+1000000000000.000000000000000 is for prohibited entries
