@@ -115,10 +115,11 @@ def main():
     # Remove max_instances_per_group to run on all 550 instances
     results = run_experiments(
         dataset_path=dataset_path,
-        max_instances_per_group=30,  # Set to None for full dataset
+        max_instances_per_group=None,  # Set to None for full dataset
         time_limit_seconds=300,
         verbose=True,
-        allowed_n_loans=(4, 8, 12),
+        # allowed_n_loans=(4, 8, 12),
+        allowed_n_loans=(4, 8),
     )
     
     # Print summary
