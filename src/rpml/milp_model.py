@@ -106,7 +106,6 @@ class RPMLModel:
         for j in range(n):
             for t in range(T):
                 objective.SetCoefficient(self.X[j, t], 1.0)
-                # C is NOT in objective - it increases balance which increases future X
                 objective.SetCoefficient(self.P[j, t], 1.0)  # P is direct fee (currently = 0)
         objective.SetMinimization()
         
@@ -140,18 +139,23 @@ class RPMLModel:
                 inactive_c = self.solver.Constraint(0, 0)
                 inactive_c.SetCoefficient(self.C[j, t], 1.0)
             
-            # Balance at release month: B[j,r_j] = principal*(1+i) - X[j,r_j] + C[j,r_j]
-            # Rearranged: B[j,r_j] + X[j,r_j] - C[j,r_j] = principal*(1+i)
-            i_rj = self.instance.interest_rates[j, r_j]
-            init_balance_value = self.instance.principals[j] * (1.0 + i_rj)
+            # Balance at release month: B[j,r_j] = principal - X[j,r_j]
+            # Note: NO interest accrued in release month (per Rios-Solis paper)
+            # Interest starts accruing from month r_j+1
+            init_balance_value = self.instance.principals[j]  # No (1+i) multiplication!
             init_balance = self.solver.Constraint(init_balance_value, init_balance_value)
             init_balance.SetCoefficient(self.B[j, r_j], 1.0)
             init_balance.SetCoefficient(self.X[j, r_j], 1.0)
-            init_balance.SetCoefficient(self.C[j, r_j], -1.0)
+            # Note: C[j,r_j] = 0 (no penalty in release month) - enforced separately
             
-            # Cap payment at release month
+            # Cap payment at release month (can pay up to full principal)
             max_payment_init = self.solver.Constraint(-self.solver.infinity(), init_balance_value)
             max_payment_init.SetCoefficient(self.X[j, r_j], 1.0)
+            
+            # No penalty in release month: C[j, r_j] = 0
+            # (loan just issued, no minimum payment due yet)
+            zero_c_release = self.solver.Constraint(0, 0)
+            zero_c_release.SetCoefficient(self.C[j, r_j], 1.0)
             
             # Balance dynamics for t > r_j: B[j,t] = B[j,t-1]*(1+i[j,t]) - X[j,t] + C[j,t]
             # Rearranged: B[j,t] + X[j,t] - C[j,t] - B[j,t-1]*(1+i) = 0
@@ -190,21 +194,12 @@ class RPMLModel:
         # C >= (min_pct*B_prev - X)*(1+h) - M*(1-Z)
         # C + (1+h)*X - (1+h)*min_pct*B_prev + M - M*Z >= 0
         # C + (1+h)*X - (1+h)*min_pct*B_prev - M*Z >= -M
+        # NOTE: Penalty applies only for t > r_j (no penalty in release month)
         for j in range(n):
             r_j = self.instance.release_time[j]
             min_pct = self.instance.min_payment_pct[j]
             
-            # At release month
-            h_rj = self.instance.default_rates[j, r_j]
-            penalty_mult_init = 1.0 + h_rj
-            min_req_init = min_pct * self.instance.principals[j]
-            
-            underpay_init = self.solver.Constraint(-self.M + penalty_mult_init * min_req_init, self.solver.infinity())
-            underpay_init.SetCoefficient(self.C[j, r_j], 1.0)
-            underpay_init.SetCoefficient(self.X[j, r_j], penalty_mult_init)
-            underpay_init.SetCoefficient(self.Z[j, r_j], -self.M)
-            
-            # For t > r_j
+            # For t > r_j only (no underpayment penalty in release month)
             for t in range(r_j + 1, self.instance.T):
                 h_jt = self.instance.default_rates[j, t]
                 penalty_mult = 1.0 + h_jt
