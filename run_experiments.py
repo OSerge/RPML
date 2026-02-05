@@ -13,8 +13,9 @@ from tqdm import tqdm
 
 from rpml.data_loader import load_all_instances, get_instances_by_size
 from rpml.milp_model import solve_rpml
-from rpml.baseline import debt_avalanche
+from rpml.baseline import debt_avalanche, debt_snowball
 from rpml.metrics import compare_solutions, print_summary, ComparisonResult
+from rpml.checkpoint import CheckpointManager
 
 
 def run_experiments(
@@ -23,85 +24,97 @@ def run_experiments(
     time_limit_seconds: int = 300,
     verbose: bool = True,
     allowed_n_loans: tuple[int, ...] = (4, 8),
+    checkpoint_path: Path | None = None,
+    restart: bool = False,
 ) -> List[ComparisonResult]:
     """
     Run experiments on all instances.
-    
-    Args:
-        dataset_path: Path to directory containing .dat files
-        max_instances_per_group: Maximum instances to process per group (None = all)
-        time_limit_seconds: Time limit for MILP solver
-        verbose: Print progress
-        allowed_n_loans: Process only instances with these loan counts
-    
-    Returns:
-        List of ComparisonResult objects
+
+    Results are saved incrementally to the checkpoint file. Already processed
+    instances are skipped on resume.
     """
     if verbose:
         print("Loading instances...")
-    
+
     instances = load_all_instances(dataset_path)
     grouped = get_instances_by_size(instances)
-    
+
     if verbose:
         print(f"Loaded {len(instances)} instances")
         for n, group in grouped.items():
             print(f"  {n} loans: {len(group)} instances")
-    
+
+    checkpoint = (
+        CheckpointManager(checkpoint_path, restart=restart)
+        if checkpoint_path
+        else None
+    )
+    processed = checkpoint.get_processed_instances() if checkpoint else set()
+    if verbose and processed:
+        print(f"Resuming: {len(processed)} instances already in checkpoint")
+
     results = []
-    
-    # Process each group
+
     for n_loans in allowed_n_loans:
         group_instances = grouped.get(n_loans, [])
-        
+
         if not group_instances:
             continue
-        
+
         if max_instances_per_group:
             group_instances = group_instances[:max_instances_per_group]
-        
+
         if verbose:
             print(f"\nProcessing {n_loans}-loan instances ({len(group_instances)} instances)...")
-        
+
         iterator = tqdm(group_instances) if verbose else group_instances
-        
+
         for instance in iterator:
+            if instance.name in processed:
+                if verbose:
+                    tqdm.write(f"Skipping {instance.name} (already processed)")
+                continue
+
             try:
-                # Solve optimal MILP
                 optimal_solution = solve_rpml(instance, time_limit_seconds=time_limit_seconds)
-                
-                # Skip if not optimal or feasible
+
                 if optimal_solution.status not in ["OPTIMAL", "FEASIBLE"]:
                     if verbose:
                         print(f"\nWarning: {instance.name} status: {optimal_solution.status}")
                     continue
-                
-                # Solve baseline (Debt Avalanche)
-                baseline_solution = debt_avalanche(instance)
-                
-                # Only compare if baseline also achieves near-zero final balance
-                # (i.e., baseline can actually pay off all debts)
-                max_final_balance = np.max(np.abs(baseline_solution.balances[:, -1]))
-                if max_final_balance > 1e6:  # Skip if any loan has >1M remaining
-                    if verbose:
-                        tqdm.write(f"  Skipping {instance.name}: baseline can't pay off (max balance: {max_final_balance:,.0f})")
-                    continue
-                
-                # Compare
+
+                avalanche_solution = debt_avalanche(instance)
+                snowball_solution = debt_snowball(instance)
+                avalanche_feasible = bool(np.max(np.abs(avalanche_solution.balances[:, -1])) < 1e6)
+                snowball_feasible = bool(np.max(np.abs(snowball_solution.balances[:, -1])) < 1e6)
+
+                if verbose and not avalanche_feasible:
+                    tqdm.write(f"  {instance.name}: Debt Avalanche infeasible (max balance: {np.max(np.abs(avalanche_solution.balances[:, -1])):,.0f})")
+                if verbose and not snowball_feasible:
+                    tqdm.write(f"  {instance.name}: Debt Snowball infeasible (max balance: {np.max(np.abs(snowball_solution.balances[:, -1])):,.0f})")
+
                 comparison = compare_solutions(
                     optimal=optimal_solution,
-                    baseline=baseline_solution,
+                    avalanche=avalanche_solution,
+                    snowball=snowball_solution,
                     instance_name=instance.name,
                     n_loans=n_loans,
+                    avalanche_feasible=avalanche_feasible,
+                    snowball_feasible=snowball_feasible,
                 )
-                
+
                 results.append(comparison)
-                
+                if checkpoint:
+                    checkpoint.save_result(comparison)
+                processed.add(instance.name)
+
             except Exception as e:
                 if verbose:
                     print(f"\nError processing {instance.name}: {e}")
                 continue
-    
+
+    if checkpoint:
+        results = list(checkpoint.load_existing_results().values())
     return results
 
 
@@ -151,39 +164,57 @@ def parse_args() -> argparse.Namespace:
         help="Number of parallel workers (default: CPU count)",
     )
     
+    parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Path to checkpoint file (default: tmp/experiment_results_checkpoint.jsonl)",
+    )
+    
+    parser.add_argument(
+        "--restart",
+        action="store_true",
+        help="Ignore existing checkpoint and start fresh",
+    )
+    
     return parser.parse_args()
 
 
 def process_instance(args_tuple):
     """Process a single instance (for multiprocessing)."""
-    instance, time_limit_seconds, verbose = args_tuple
-    
+    instance, time_limit_seconds, verbose, checkpoint_path = args_tuple
+
+    if checkpoint_path is not None:
+        checkpoint = CheckpointManager(Path(str(checkpoint_path)))
+        if instance.name in checkpoint.get_processed_instances():
+            return ("skip_processed", instance.name)
+
     try:
-        # Solve optimal MILP
         optimal_solution = solve_rpml(instance, time_limit_seconds=time_limit_seconds)
-        
-        # Skip if not optimal or feasible
+
         if optimal_solution.status not in ["OPTIMAL", "FEASIBLE"]:
             return ("skip_status", instance.name, optimal_solution.status)
-        
-        # Solve baseline (Debt Avalanche)
-        baseline_solution = debt_avalanche(instance)
-        
-        # Only compare if baseline also achieves near-zero final balance
-        max_final_balance = np.max(np.abs(baseline_solution.balances[:, -1]))
-        if max_final_balance > 1e6:
-            return ("skip_balance", instance.name, max_final_balance)
-        
-        # Compare
+
+        avalanche_solution = debt_avalanche(instance)
+        snowball_solution = debt_snowball(instance)
+        avalanche_feasible = bool(np.max(np.abs(avalanche_solution.balances[:, -1])) < 1e6)
+        snowball_feasible = bool(np.max(np.abs(snowball_solution.balances[:, -1])) < 1e6)
+
         comparison = compare_solutions(
             optimal=optimal_solution,
-            baseline=baseline_solution,
+            avalanche=avalanche_solution,
+            snowball=snowball_solution,
             instance_name=instance.name,
             n_loans=instance.n,
+            avalanche_feasible=avalanche_feasible,
+            snowball_feasible=snowball_feasible,
         )
-        
+
+        if checkpoint_path is not None:
+            checkpoint.save_result(comparison)
         return ("ok", comparison)
-        
+
     except Exception as e:
         return ("error", instance.name, str(e))
 
@@ -195,99 +226,135 @@ def run_experiments_parallel(
     verbose: bool = True,
     allowed_n_loans: tuple[int, ...] = (4, 8),
     n_workers: int = None,
+    checkpoint_path: Path | None = None,
+    restart: bool = False,
 ) -> List[ComparisonResult]:
     """
     Run experiments on all instances using multiprocessing.
-    
-    Args:
-        dataset_path: Path to directory containing .dat files
-        max_instances_per_group: Maximum instances to process per group (None = all)
-        time_limit_seconds: Time limit for MILP solver
-        verbose: Print progress
-        allowed_n_loans: Process only instances with these loan counts
-        n_workers: Number of parallel workers (None = CPU count)
-    
-    Returns:
-        List of ComparisonResult objects
+
+    Results are saved incrementally to the checkpoint file. Already processed
+    instances are skipped on resume.
     """
-    from multiprocessing import Pool, cpu_count
-    
+    from multiprocessing import cpu_count
+
     if verbose:
         print("Loading instances...")
-    
+
     instances = load_all_instances(dataset_path)
     grouped = get_instances_by_size(instances)
-    
+
     if verbose:
         print(f"Loaded {len(instances)} instances")
         for n, group in grouped.items():
             print(f"  {n} loans: {len(group)} instances")
-    
-    # Collect all instances to process
+
     all_instances = []
     for n_loans in allowed_n_loans:
         group_instances = grouped.get(n_loans, [])
-        
+
         if not group_instances:
             continue
-        
+
         if max_instances_per_group:
             group_instances = group_instances[:max_instances_per_group]
-        
+
         all_instances.extend(group_instances)
-    
+
+    checkpoint = (
+        CheckpointManager(checkpoint_path, restart=restart)
+        if checkpoint_path
+        else None
+    )
+    processed = checkpoint.get_processed_instances() if checkpoint else set()
+    if checkpoint_path and processed and verbose:
+        print(f"Resuming: {len(processed)} instances already in checkpoint")
+
+    to_process = [inst for inst in all_instances if inst.name not in processed]
     if verbose:
-        print(f"\nProcessing {len(all_instances)} instances in parallel...")
-    
-    # Prepare arguments for multiprocessing
-    args_list = [(inst, time_limit_seconds, False) for inst in all_instances]
-    
-    # Run in parallel
+        print(f"\nProcessing {len(to_process)} instances in parallel...")
+
+    ck_path_str = str(checkpoint_path) if checkpoint_path else None
+    args_list = [(inst, time_limit_seconds, False, ck_path_str) for inst in to_process]
+
     n_workers = n_workers or cpu_count()
     if verbose:
         print(f"Using {n_workers} workers")
+
+    # Per-instance timeout: MILP time limit + safety margin for baseline + overhead
+    per_instance_timeout = time_limit_seconds * 1.5 + 30
+
+    from concurrent.futures import ProcessPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
     
-    with Pool(n_workers) as pool:
+    raw_results = []
+    with ProcessPoolExecutor(max_workers=n_workers) as executor:
+        futures = {
+            executor.submit(process_instance, args): i
+            for i, args in enumerate(args_list)
+        }
+
         if verbose:
-            raw_results = list(tqdm(
-                pool.imap(process_instance, args_list),
-                total=len(args_list),
-            ))
+            with tqdm(total=len(futures)) as pbar:
+                for future in as_completed(futures, timeout=per_instance_timeout):
+                    try:
+                        result = future.result(timeout=1)
+                        raw_results.append(result)
+                    except FuturesTimeoutError:
+                        idx = futures[future]
+                        inst = args_list[idx][0]
+                        raw_results.append(("error", inst.name, "Timeout exceeded"))
+                    except Exception as e:
+                        idx = futures[future]
+                        inst = args_list[idx][0]
+                        raw_results.append(("error", inst.name, str(e)))
+                    finally:
+                        pbar.update(1)
         else:
-            raw_results = list(pool.imap(process_instance, args_list))
-    
-    # Process results and report issues
-    results = []
+            for future in as_completed(futures):
+                try:
+                    result = future.result(timeout=1)
+                    raw_results.append(result)
+                except Exception as e:
+                    idx = futures[future]
+                    inst = args_list[idx][0]
+                    raw_results.append(("error", inst.name, str(e)))
+
     for r in raw_results:
         if r is None:
             continue
-        if r[0] == "ok":
-            results.append(r[1])
+        if r[0] == "skip_processed":
+            pass
         elif r[0] == "skip_status" and verbose:
             print(f"  Skipped {r[1]}: status {r[2]}")
-        elif r[0] == "skip_balance" and verbose:
-            print(f"  Skipped {r[1]}: baseline can't pay off (max balance: {r[2]:,.0f})")
         elif r[0] == "error" and verbose:
             print(f"  Error {r[1]}: {r[2]}")
-    
+
+    if checkpoint:
+        return list(checkpoint.load_existing_results().values())
+    results = []
+    for r in raw_results:
+        if r is not None and r[0] == "ok":
+            results.append(r[1])
     return results
 
 
 def main():
     """Main entry point."""
     args = parse_args()
-    
+
     dataset_path = Path(__file__).parent / "RiosSolisDataset" / "Instances" / "Instances"
-    
+
     if not dataset_path.exists():
         print(f"Error: Dataset path not found: {dataset_path}")
         return
-    
+
+    tmp_dir = Path(__file__).parent / "tmp"
+    checkpoint_path = args.checkpoint or (tmp_dir / "experiment_results_checkpoint.jsonl")
+
     print("=" * 60)
     print("RPML EXPERIMENTS")
     print("=" * 60)
     print("\nRunning experiments on Rios-Solis dataset...")
-    print("Comparing optimal MILP solutions with Debt Avalanche baseline.")
+    print("Comparing optimal MILP with Debt Avalanche and Debt Snowball baselines.")
     print(f"\nParameters:")
     print(f"  Max instances per group: {args.max_instances or 'all'}")
     print(f"  Loan counts: {args.n_loans}")
@@ -295,9 +362,11 @@ def main():
     print(f"  Multiprocessing: {'enabled' if args.parallel else 'disabled'}")
     if args.parallel:
         print(f"  Workers: {args.workers or 'auto (CPU count)'}")
+    print(f"  Checkpoint: {checkpoint_path}")
+    if args.restart:
+        print("  Restart: yes (ignoring existing checkpoint)")
     print()
-    
-    # Run experiments
+
     if args.parallel:
         results = run_experiments_parallel(
             dataset_path=dataset_path,
@@ -306,6 +375,8 @@ def main():
             verbose=True,
             allowed_n_loans=tuple(args.n_loans),
             n_workers=args.workers,
+            checkpoint_path=checkpoint_path,
+            restart=args.restart,
         )
     else:
         results = run_experiments(
@@ -314,33 +385,18 @@ def main():
             time_limit_seconds=args.time_limit,
             verbose=True,
             allowed_n_loans=tuple(args.n_loans),
+            checkpoint_path=checkpoint_path,
+            restart=args.restart,
         )
-    
-    # Print summary
+
     print("\n" + "=" * 60)
     print_summary(results)
-    
-    # Save results
-    if results:
-        import pandas as pd
-        
-        results_df = pd.DataFrame([
-            {
-                'instance': r.instance_name,
-                'n_loans': r.n_loans,
-                'optimal_cost': r.optimal_cost,
-                'baseline_cost': r.baseline_cost,
-                'savings_pct': r.relative_savings,
-                'solve_time': r.optimal_solve_time,
-                'gap': r.optimal_gap,
-                'status': r.optimal_status,
-            }
-            for r in results
-        ])
-        
-        output_path = Path(__file__).parent / "experiment_results.csv"
-        results_df.to_csv(output_path, index=False)
-        print(f"\nResults saved to: {output_path}")
+
+    checkpoint = CheckpointManager(checkpoint_path)
+    csv_path = Path(__file__).parent / "experiment_results.csv"
+    checkpoint.export_to_csv(csv_path)
+    if checkpoint.load_existing_results():
+        print(f"\nResults exported to: {csv_path}")
 
 
 if __name__ == "__main__":
