@@ -178,6 +178,12 @@ def parse_args() -> argparse.Namespace:
         help="Ignore existing checkpoint and start fresh",
     )
     
+    parser.add_argument(
+        "--summary",
+        action="store_true",
+        help="Show summary of existing checkpoint results and exit (don't run experiments)",
+    )
+    
     return parser.parse_args()
 
 
@@ -349,6 +355,28 @@ def main():
 
     tmp_dir = Path(__file__).parent / "tmp"
     checkpoint_path = args.checkpoint or (tmp_dir / "experiment_results_checkpoint.jsonl")
+
+    # Handle --summary mode
+    if args.summary:
+        print("=" * 60)
+        print("RPML EXPERIMENT RESULTS SUMMARY")
+        print("=" * 60)
+        print(f"\nLoading results from: {checkpoint_path}\n")
+        
+        checkpoint = CheckpointManager(checkpoint_path)
+        results = list(checkpoint.load_existing_results().values())
+        
+        if not results:
+            print("No results found in checkpoint.")
+            return
+        
+        print_summary(results)
+        
+        csv_path = Path(__file__).parent / "experiment_results.csv"
+        checkpoint.export_to_csv(csv_path)
+        if results:
+            print(f"\nResults exported to: {csv_path}")
+        return
 
     print("=" * 60)
     print("RPML EXPERIMENTS")
