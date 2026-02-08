@@ -60,7 +60,8 @@ class RPMLModel:
         self.solver = pywraplp.Solver.CreateSolver('HIGHS')
         if self.solver is None:
             raise RuntimeError("HiGHS solver not available. Install OR-Tools with HiGHS support.")
-        
+        if hasattr(self.solver, 'SuppressOutput'):
+            self.solver.SuppressOutput()
         if time_limit_seconds is not None:
             self.solver.SetTimeLimit(time_limit_seconds * 1000)  # Convert to milliseconds
         
@@ -237,42 +238,11 @@ class RPMLModel:
         
         import time
         start_time = time.time()
-        
         status = self.solver.Solve()
         solve_time = time.time() - start_time
-        
-        # Extract solution
+
         n = self.instance.n
         T = self.instance.T
-        
-        payments = np.zeros((n, T))
-        balances = np.zeros((n, T))
-        savings = np.zeros(T)
-        active_loans = np.zeros((n, T))
-        
-        for j in range(n):
-            for t in range(T):
-                payments[j, t] = self.X[j, t].solution_value()
-                balances[j, t] = self.B[j, t].solution_value()
-                active_loans[j, t] = self.Z[j, t].solution_value()
-        
-        for t in range(T):
-            savings[t] = self.S[t].solution_value()
-        
-        # Get objective value
-        obj_value = self.solver.Objective().Value()
-        
-        # Get gap (if available)
-        gap = 0.0
-        if hasattr(self.solver, 'GetBestObjectiveBound'):
-            try:
-                best_bound = self.solver.GetBestObjectiveBound()
-                if obj_value > 0:
-                    gap = abs(best_bound - obj_value) / obj_value * 100
-            except:
-                pass
-        
-        # Status mapping
         status_map = {
             pywraplp.Solver.OPTIMAL: "OPTIMAL",
             pywraplp.Solver.FEASIBLE: "FEASIBLE",
@@ -282,7 +252,41 @@ class RPMLModel:
             pywraplp.Solver.NOT_SOLVED: "NOT_SOLVED",
         }
         status_str = status_map.get(status, f"UNKNOWN_{status}")
-        
+
+        if status not in (pywraplp.Solver.OPTIMAL, pywraplp.Solver.FEASIBLE):
+            return RPMLSolution(
+                payments=np.zeros((n, T)),
+                balances=np.zeros((n, T)),
+                savings=np.zeros(T),
+                active_loans=np.zeros((n, T)),
+                objective_value=float("inf"),
+                solve_time=solve_time,
+                gap=0.0,
+                status=status_str,
+            )
+
+        payments = np.zeros((n, T))
+        balances = np.zeros((n, T))
+        savings = np.zeros(T)
+        active_loans = np.zeros((n, T))
+        for j in range(n):
+            for t in range(T):
+                payments[j, t] = self.X[j, t].solution_value()
+                balances[j, t] = self.B[j, t].solution_value()
+                active_loans[j, t] = self.Z[j, t].solution_value()
+        for t in range(T):
+            savings[t] = self.S[t].solution_value()
+        obj_value = self.solver.Objective().Value()
+
+        gap = 0.0
+        if hasattr(self.solver, 'GetBestObjectiveBound'):
+            try:
+                best_bound = self.solver.GetBestObjectiveBound()
+                if obj_value > 0:
+                    gap = abs(best_bound - obj_value) / obj_value * 100
+            except Exception:
+                pass
+
         return RPMLSolution(
             payments=payments,
             balances=balances,

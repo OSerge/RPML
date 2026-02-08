@@ -13,66 +13,62 @@ from .milp_model import RPMLSolution
 
 @dataclass
 class ComparisonResult:
-    """Results comparing optimal solution with baseline."""
+    """Results comparing optimal MILP solution with both baseline strategies."""
     instance_name: str
     n_loans: int
     optimal_cost: float
-    baseline_cost: float
-    relative_savings: float  # Percentage
     optimal_solve_time: float
     optimal_gap: float
     optimal_status: str
-    baseline_strategy: str
+    avalanche_cost: float
+    avalanche_feasible: bool
+    avalanche_savings: Optional[float]
+    snowball_cost: float
+    snowball_feasible: bool
+    snowball_savings: Optional[float]
 
 
-def relative_savings(optimal_cost: float, baseline_cost: float) -> float:
+def relative_savings(optimal_cost: float, baseline_cost: float) -> Optional[float]:
     """
-    Calculate relative savings percentage.
-    
+    Calculate relative savings percentage (MILP vs baseline).
+
     Formula: (baseline_cost - optimal_cost) / baseline_cost * 100
-    
-    Args:
-        optimal_cost: Cost from optimal solution
-        baseline_cost: Cost from baseline strategy
-    
-    Returns:
-        Percentage savings (positive = optimal is better)
+    Returns None if baseline_cost <= 0.
     """
     if baseline_cost <= 0:
-        return 0.0
+        return None
     return (baseline_cost - optimal_cost) / baseline_cost * 100.0
 
 
 def compare_solutions(
     optimal: RPMLSolution,
-    baseline: BaselineSolution,
+    avalanche: BaselineSolution,
+    snowball: BaselineSolution,
     instance_name: str,
     n_loans: int,
+    avalanche_feasible: bool,
+    snowball_feasible: bool,
 ) -> ComparisonResult:
     """
-    Compare optimal MILP solution with baseline strategy.
-    
-    Args:
-        optimal: Optimal solution from MILP solver
-        baseline: Solution from baseline algorithm
-        instance_name: Name of the instance
-        n_loans: Number of loans in instance
-    
-    Returns:
-        ComparisonResult with metrics
+    Compare MILP solution with both baseline strategies.
+
+    When MILP status is not OPTIMAL/FEASIBLE, savings are set to None
+    (comparison still records costs and status for checkpointing).
     """
-    savings_pct = relative_savings(optimal.objective_value, baseline.total_cost)
-    
+    optimal_ok = optimal.status in ("OPTIMAL", "FEASIBLE")
     return ComparisonResult(
         instance_name=instance_name,
         n_loans=n_loans,
         optimal_cost=optimal.objective_value,
-        baseline_cost=baseline.total_cost,
-        relative_savings=savings_pct,
         optimal_solve_time=optimal.solve_time,
         optimal_gap=optimal.gap,
         optimal_status=optimal.status,
-        baseline_strategy=baseline.strategy_name,
+        avalanche_cost=avalanche.total_cost,
+        avalanche_feasible=avalanche_feasible,
+        avalanche_savings=relative_savings(optimal.objective_value, avalanche.total_cost) if (avalanche_feasible and optimal_ok) else None,
+        snowball_cost=snowball.total_cost,
+        snowball_feasible=snowball_feasible,
+        snowball_savings=relative_savings(optimal.objective_value, snowball.total_cost) if (snowball_feasible and optimal_ok) else None,
     )
 
 
@@ -118,92 +114,96 @@ def validate_solution(solution: RPMLSolution, instance) -> tuple[bool, list[str]
 def aggregate_results(results: list[ComparisonResult]) -> dict:
     """
     Aggregate comparison results across multiple instances.
-    
-    Args:
-        results: List of ComparisonResult objects
-    
-    Returns:
-        Dictionary with aggregated statistics
     """
     if not results:
         return {}
-    
-    # Group by number of loans
+
+    avalanche_savings = [r.avalanche_savings for r in results if r.avalanche_savings is not None]
+    snowball_savings = [r.snowball_savings for r in results if r.snowball_savings is not None]
+
     by_n_loans = {}
     for r in results:
         if r.n_loans not in by_n_loans:
             by_n_loans[r.n_loans] = []
         by_n_loans[r.n_loans].append(r)
-    
+
     aggregated = {
         'total_instances': len(results),
+        'avalanche_feasible_count': sum(1 for r in results if r.avalanche_feasible),
+        'avalanche_infeasible_count': sum(1 for r in results if not r.avalanche_feasible),
+        'snowball_feasible_count': sum(1 for r in results if r.snowball_feasible),
+        'snowball_infeasible_count': sum(1 for r in results if not r.snowball_feasible),
+        'avalanche_savings': avalanche_savings,
+        'snowball_savings': snowball_savings,
         'by_n_loans': {},
     }
-    
-    for n_loans, group_results in by_n_loans.items():
-        savings = [r.relative_savings for r in group_results]
-        solve_times = [r.optimal_solve_time for r in group_results]
-        gaps = [r.optimal_gap for r in group_results]
-        
+
+    for n_loans, group in by_n_loans.items():
+        av_s = [r.avalanche_savings for r in group if r.avalanche_savings is not None]
+        sn_s = [r.snowball_savings for r in group if r.snowball_savings is not None]
+        solve_times = [r.optimal_solve_time for r in group]
+        gaps = [r.optimal_gap for r in group]
         aggregated['by_n_loans'][n_loans] = {
-            'count': len(group_results),
-            'avg_savings_pct': np.mean(savings),
-            'median_savings_pct': np.median(savings),
-            'min_savings_pct': np.min(savings),
-            'max_savings_pct': np.max(savings),
-            'std_savings_pct': np.std(savings),
+            'count': len(group),
+            'avalanche_feasible': sum(1 for r in group if r.avalanche_feasible),
+            'snowball_feasible': sum(1 for r in group if r.snowball_feasible),
+            'avalanche_avg_savings': np.mean(av_s) if av_s else None,
+            'snowball_avg_savings': np.mean(sn_s) if sn_s else None,
             'avg_solve_time': np.mean(solve_times),
-            'median_solve_time': np.median(solve_times),
             'avg_gap': np.mean(gaps),
-            'median_gap': np.median(gaps),
         }
-    
-    # Overall statistics
-    all_savings = [r.relative_savings for r in results]
-    aggregated['overall'] = {
-        'avg_savings_pct': np.mean(all_savings),
-        'median_savings_pct': np.median(all_savings),
-        'min_savings_pct': np.min(all_savings),
-        'max_savings_pct': np.max(all_savings),
+
+    aggregated['overall_avalanche'] = {
+        'avg_savings_pct': float(np.mean(avalanche_savings)) if avalanche_savings else None,
+        'median_savings_pct': float(np.median(avalanche_savings)) if avalanche_savings else None,
+        'min_savings_pct': float(np.min(avalanche_savings)) if avalanche_savings else None,
+        'max_savings_pct': float(np.max(avalanche_savings)) if avalanche_savings else None,
     }
-    
+    aggregated['overall_snowball'] = {
+        'avg_savings_pct': float(np.mean(snowball_savings)) if snowball_savings else None,
+        'median_savings_pct': float(np.median(snowball_savings)) if snowball_savings else None,
+        'min_savings_pct': float(np.min(snowball_savings)) if snowball_savings else None,
+        'max_savings_pct': float(np.max(snowball_savings)) if snowball_savings else None,
+    }
     return aggregated
 
 
 def print_summary(results: list[ComparisonResult]):
     """
-    Print a summary of comparison results.
-    
-    Args:
-        results: List of ComparisonResult objects
+    Print a summary of comparison results (MILP vs Avalanche and vs Snowball).
     """
     if not results:
         print("No results to summarize.")
         return
-    
-    aggregated = aggregate_results(results)
-    
+
+    agg = aggregate_results(results)
+
     print("=" * 60)
     print("RPML EXPERIMENT RESULTS SUMMARY")
     print("=" * 60)
-    print(f"\nTotal instances: {aggregated['total_instances']}")
-    
-    print("\nOverall Statistics:")
-    overall = aggregated['overall']
-    print(f"  Average savings: {overall['avg_savings_pct']:.2f}%")
-    print(f"  Median savings: {overall['median_savings_pct']:.2f}%")
-    print(f"  Min savings: {overall['min_savings_pct']:.2f}%")
-    print(f"  Max savings: {overall['max_savings_pct']:.2f}%")
-    
+    print(f"\nTotal instances: {agg['total_instances']}")
+    print(f"\nDebt Avalanche: feasible {agg['avalanche_feasible_count']}, infeasible {agg['avalanche_infeasible_count']}")
+    if agg['overall_avalanche']['avg_savings_pct'] is not None:
+        o = agg['overall_avalanche']
+        print(f"  MILP vs Avalanche (feasible only): avg savings {o['avg_savings_pct']:.2f}%, range [{o['min_savings_pct']:.2f}%, {o['max_savings_pct']:.2f}%]")
+    else:
+        print("  MILP vs Avalanche: no feasible instances")
+    print(f"\nDebt Snowball: feasible {agg['snowball_feasible_count']}, infeasible {agg['snowball_infeasible_count']}")
+    if agg['overall_snowball']['avg_savings_pct'] is not None:
+        o = agg['overall_snowball']
+        print(f"  MILP vs Snowball (feasible only): avg savings {o['avg_savings_pct']:.2f}%, range [{o['min_savings_pct']:.2f}%, {o['max_savings_pct']:.2f}%]")
+    else:
+        print("  MILP vs Snowball: no feasible instances")
+
     print("\nBy Number of Loans:")
-    for n_loans in sorted(aggregated['by_n_loans'].keys()):
-        stats = aggregated['by_n_loans'][n_loans]
-        print(f"\n  {n_loans} loans ({stats['count']} instances):")
-        print(f"    Average savings: {stats['avg_savings_pct']:.2f}%")
-        print(f"    Median savings: {stats['median_savings_pct']:.2f}%")
-        print(f"    Range: [{stats['min_savings_pct']:.2f}%, {stats['max_savings_pct']:.2f}%]")
-        print(f"    Average solve time: {stats['avg_solve_time']:.2f}s")
-        print(f"    Average gap: {stats['avg_gap']:.2f}%")
-    
+    for n_loans in sorted(agg['by_n_loans'].keys()):
+        s = agg['by_n_loans'][n_loans]
+        print(f"\n  {n_loans} loans ({s['count']} instances): Avalanche feasible {s['avalanche_feasible']}, Snowball feasible {s['snowball_feasible']}")
+        if s['avalanche_avg_savings'] is not None:
+            print(f"    Avalanche avg savings: {s['avalanche_avg_savings']:.2f}%")
+        if s['snowball_avg_savings'] is not None:
+            print(f"    Snowball avg savings: {s['snowball_avg_savings']:.2f}%")
+        print(f"    Avg solve time: {s['avg_solve_time']:.2f}s, avg gap: {s['avg_gap']:.2f}%")
+
     print("\n" + "=" * 60)
 

@@ -60,12 +60,12 @@ class RiosSolisInstance:
         assert self.principals.shape == (self.n,), f"principals shape mismatch: {self.principals.shape}"
         assert self.interest_rates.shape == (self.n, self.T), f"interest_rates shape mismatch: {self.interest_rates.shape}"
         assert self.default_rates.shape == (self.n, self.T), f"default_rates shape mismatch: {self.default_rates.shape}"
-        assert self.min_payment_pct.shape == (self.n,), f"min_payment_pct shape mismatch"
-        assert self.prepay_penalty.shape == (self.n,), f"prepay_penalty shape mismatch"
+        assert self.min_payment_pct.shape == (self.n,), f"min_payment_pct shape mismatch: {self.min_payment_pct.shape}"
+        assert self.prepay_penalty.shape == (self.n,), f"prepay_penalty shape mismatch: {self.prepay_penalty.shape}"
         assert self.monthly_income.shape == (self.T,), f"monthly_income shape mismatch: {self.monthly_income.shape}"
-        assert self.release_time.shape == (self.n,), f"release_time shape mismatch"
-        assert self.stipulated_amount.shape == (self.n,), f"stipulated_amount shape mismatch"
-        assert self.fixed_payment.shape == (self.n,), f"fixed_payment shape mismatch"
+        assert self.release_time.shape == (self.n,), f"release_time shape mismatch: {self.release_time.shape}"
+        assert self.stipulated_amount.shape == (self.n,), f"stipulated_amount shape mismatch: {self.stipulated_amount.shape}"
+        assert self.fixed_payment.shape == (self.n,), f"fixed_payment shape mismatch: {self.fixed_payment.shape}"
     
     @property
     def total_debt(self) -> float:

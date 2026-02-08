@@ -5,6 +5,7 @@ Compares optimal MILP solutions with baseline strategies.
 """
 
 import argparse
+import sys
 from pathlib import Path
 from typing import List
 
@@ -50,8 +51,12 @@ def run_experiments(
         else None
     )
     processed = checkpoint.get_processed_instances() if checkpoint else set()
-    if verbose and processed:
-        print(f"Resuming: {len(processed)} instances already in checkpoint")
+    
+    if verbose and checkpoint_path:
+        if processed:
+            print(f"Resuming: {len(processed)} instances already in checkpoint")
+        else:
+            print("Starting fresh (no checkpoint found or checkpoint is empty)")
 
     results = []
 
@@ -67,31 +72,29 @@ def run_experiments(
         if verbose:
             print(f"\nProcessing {n_loans}-loan instances ({len(group_instances)} instances)...")
 
-        iterator = tqdm(group_instances) if verbose else group_instances
+        iterator = tqdm(group_instances, file=sys.stdout) if verbose else group_instances
 
         for instance in iterator:
             if instance.name in processed:
                 if verbose:
-                    tqdm.write(f"Skipping {instance.name} (already processed)")
+                    tqdm.write(f"Skipping {instance.name} (already processed)", file=sys.stdout)
                 continue
 
             try:
                 optimal_solution = solve_rpml(instance, time_limit_seconds=time_limit_seconds)
 
-                if optimal_solution.status not in ["OPTIMAL", "FEASIBLE"]:
-                    if verbose:
-                        print(f"\nWarning: {instance.name} status: {optimal_solution.status}")
-                    continue
-
                 avalanche_solution = debt_avalanche(instance)
                 snowball_solution = debt_snowball(instance)
-                avalanche_feasible = bool(np.max(np.abs(avalanche_solution.balances[:, -1])) < 1e6)
-                snowball_feasible = bool(np.max(np.abs(snowball_solution.balances[:, -1])) < 1e6)
+                avalanche_feasible = bool(np.max(np.abs(avalanche_solution.balances[:, -1])) < 1.0)
+                snowball_feasible = bool(np.max(np.abs(snowball_solution.balances[:, -1])) < 1.0)
 
+                if optimal_solution.status not in ["OPTIMAL", "FEASIBLE"]:
+                    if verbose:
+                        tqdm.write(f"Warning: {instance.name} MILP status: {optimal_solution.status}", file=sys.stdout)
                 if verbose and not avalanche_feasible:
-                    tqdm.write(f"  {instance.name}: Debt Avalanche infeasible (max balance: {np.max(np.abs(avalanche_solution.balances[:, -1])):,.0f})")
+                    tqdm.write(f"  {instance.name}: Debt Avalanche infeasible (max balance: {np.max(np.abs(avalanche_solution.balances[:, -1])):,.0f})", file=sys.stdout)
                 if verbose and not snowball_feasible:
-                    tqdm.write(f"  {instance.name}: Debt Snowball infeasible (max balance: {np.max(np.abs(snowball_solution.balances[:, -1])):,.0f})")
+                    tqdm.write(f"  {instance.name}: Debt Snowball infeasible (max balance: {np.max(np.abs(snowball_solution.balances[:, -1])):,.0f})", file=sys.stdout)
 
                 comparison = compare_solutions(
                     optimal=optimal_solution,
@@ -189,23 +192,18 @@ def parse_args() -> argparse.Namespace:
 
 def process_instance(args_tuple):
     """Process a single instance (for multiprocessing)."""
-    instance, time_limit_seconds, verbose, checkpoint_path = args_tuple
+    instance, time_limit_seconds, verbose, checkpoint_path, processed_set = args_tuple
 
-    if checkpoint_path is not None:
-        checkpoint = CheckpointManager(Path(str(checkpoint_path)))
-        if instance.name in checkpoint.get_processed_instances():
-            return ("skip_processed", instance.name)
+    if processed_set is not None and instance.name in processed_set:
+        return ("skip_processed", instance.name)
 
     try:
         optimal_solution = solve_rpml(instance, time_limit_seconds=time_limit_seconds)
 
-        if optimal_solution.status not in ["OPTIMAL", "FEASIBLE"]:
-            return ("skip_status", instance.name, optimal_solution.status)
-
         avalanche_solution = debt_avalanche(instance)
         snowball_solution = debt_snowball(instance)
-        avalanche_feasible = bool(np.max(np.abs(avalanche_solution.balances[:, -1])) < 1e6)
-        snowball_feasible = bool(np.max(np.abs(snowball_solution.balances[:, -1])) < 1e6)
+        avalanche_feasible = bool(np.max(np.abs(avalanche_solution.balances[:, -1])) < 1.0)
+        snowball_feasible = bool(np.max(np.abs(snowball_solution.balances[:, -1])) < 1.0)
 
         comparison = compare_solutions(
             optimal=optimal_solution,
@@ -218,8 +216,10 @@ def process_instance(args_tuple):
         )
 
         if checkpoint_path is not None:
+            checkpoint = CheckpointManager(Path(str(checkpoint_path)))
             checkpoint.save_result(comparison)
-        return ("ok", comparison)
+        status = optimal_solution.status
+        return ("ok", comparison) if status in ("OPTIMAL", "FEASIBLE") else ("ok_infeasible", comparison)
 
     except Exception as e:
         return ("error", instance.name, str(e))
@@ -272,15 +272,21 @@ def run_experiments_parallel(
         else None
     )
     processed = checkpoint.get_processed_instances() if checkpoint else set()
-    if checkpoint_path and processed and verbose:
-        print(f"Resuming: {len(processed)} instances already in checkpoint")
+    
+    if verbose and checkpoint_path:
+        if processed:
+            print(f"Resuming: {len(processed)} instances already in checkpoint")
+        else:
+            print("Starting fresh (no checkpoint found or checkpoint is empty)")
 
     to_process = [inst for inst in all_instances if inst.name not in processed]
     if verbose:
         print(f"\nProcessing {len(to_process)} instances in parallel...")
+        if processed:
+            print(f"  (Skipped {len(all_instances) - len(to_process)} already processed)")
 
     ck_path_str = str(checkpoint_path) if checkpoint_path else None
-    args_list = [(inst, time_limit_seconds, False, ck_path_str) for inst in to_process]
+    args_list = [(inst, time_limit_seconds, False, ck_path_str, processed) for inst in to_process]
 
     n_workers = n_workers or cpu_count()
     if verbose:
@@ -299,7 +305,7 @@ def run_experiments_parallel(
         }
 
         if verbose:
-            with tqdm(total=len(futures)) as pbar:
+            with tqdm(total=len(futures), file=sys.stdout) as pbar:
                 for future in as_completed(futures, timeout=per_instance_timeout):
                     try:
                         result = future.result(timeout=1)
@@ -338,7 +344,7 @@ def run_experiments_parallel(
         return list(checkpoint.load_existing_results().values())
     results = []
     for r in raw_results:
-        if r is not None and r[0] == "ok":
+        if r is not None and r[0] in ("ok", "ok_infeasible"):
             results.append(r[1])
     return results
 

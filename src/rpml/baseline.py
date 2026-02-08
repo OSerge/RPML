@@ -8,7 +8,6 @@ Implements common heuristic approaches:
 """
 
 from dataclasses import dataclass
-from typing import Dict
 
 import numpy as np
 
@@ -268,13 +267,15 @@ def debt_average(instance: RiosSolisInstance) -> BaselineSolution:
     for t in range(T):
         available = instance.monthly_income[t] + (savings[t-1] if t > 0 else 0)
         
-        # Get active loans sorted by average rate (descending)
+        # Get active loans at release month (t >= r_j) and after, sorted by average rate (descending)
         active_loans = []
         for j in range(n):
             r_j = instance.release_time[j]
-            if t > r_j and balances[j, t-1] > 1e-6:
-                min_req = instance.min_payment_pct[j] * balances[j, t-1]
-                active_loans.append((j, avg_rates[j], min_req))
+            if t >= r_j:
+                current_balance = instance.principals[j] if t == r_j else balances[j, t-1]
+                if current_balance > 1e-6:
+                    min_req = 0.0 if t == r_j else instance.min_payment_pct[j] * current_balance
+                    active_loans.append((j, avg_rates[j], min_req))
         
         # Sort by average rate descending
         active_loans.sort(key=lambda x: x[1], reverse=True)
@@ -299,7 +300,11 @@ def debt_average(instance: RiosSolisInstance) -> BaselineSolution:
             if total_rate > 0:
                 for idx, j in enumerate(active_loan_indices):
                     proportion = active_rates[idx] / total_rate
-                    max_payment = balances[j, t-1] * (1 + instance.interest_rates[j, t])
+                    r_j = instance.release_time[j]
+                    if t == r_j:
+                        max_payment = instance.principals[j]
+                    else:
+                        max_payment = balances[j, t-1] * (1 + instance.interest_rates[j, t])
                     extra_payment = min(remaining_budget * proportion, max(0, max_payment - min_payments[j]))
                     min_payments[j] += extra_payment
                     remaining_budget -= extra_payment
