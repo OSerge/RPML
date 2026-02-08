@@ -404,7 +404,6 @@ dependencies = [
     { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "ortools" },
     { name = "pandas" },
-    { name = "pytest" },
     { name = "tqdm" },
 ]
 
@@ -418,7 +417,6 @@ requires-dist = [
     { name = "numpy", specifier = ">=1.24.0" },
     { name = "ortools", specifier = ">=9.8" },
     { name = "pandas", specifier = ">=2.0.0" },
-    { name = "pytest", specifier = ">=7.0.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0.0" },
     { name = "tqdm", specifier = ">=4.65.0" },
 ]
