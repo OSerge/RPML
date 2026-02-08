@@ -20,13 +20,17 @@ RPML/
 │   └── rpml/
 │       ├── __init__.py
 │       ├── data_loader.py      # Парсинг .dat файлов
-│       ├── milp_model.py        # MILP модель (OR-Tools + HiGHS)
-│       ├── baseline.py          # Baseline алгоритмы
-│       └── metrics.py           # Метрики сравнения
+│       ├── milp_model.py       # MILP модель (OR-Tools + HiGHS)
+│       ├── baseline.py         # Baseline алгоритмы (Avalanche, Snowball, Average)
+│       ├── metrics.py         # Метрики сравнения решений
+│       └── checkpoint.py     # Чекпоинты для возобновления экспериментов
 ├── tests/
 │   ├── __init__.py
 │   ├── test_data_loader.py
-│   └── test_baseline.py
+│   ├── test_baseline.py
+│   ├── test_baseline_comprehensive.py
+│   ├── test_milp_model.py
+│   └── test_checkpoint.py
 ├── RiosSolisDataset/        # Датасет из статьи
 ├── run_experiments.py       # Скрипт для запуска экспериментов
 ├── pyproject.toml           # Конфигурация проекта и зависимости
@@ -58,6 +62,10 @@ print(f"Gap: {solution.gap:.2f}%")
 ```
 
 ### Baseline алгоритмы
+- **Debt Avalanche**: приоритет займам с наибольшей процентной ставкой.
+- **Debt Snowball**: приоритет займам с наименьшим остатком.
+- **Debt Average**: распределение платежей пропорционально средним ставкам.
+
 ```python
 from rpml.baseline import debt_avalanche, debt_snowball, debt_average
 
