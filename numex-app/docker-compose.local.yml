@@ -1,0 +1,15 @@
+services:
+  vllm-server:
+    command: >
+      vllm serve Qwen/Qwen2.5-3B-Instruct
+      --port 8001
+      --host 0.0.0.0
+      --gpu-memory-utilization 0.85
+      --max-model-len 8192
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

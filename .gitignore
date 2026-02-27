@@ -12,6 +12,7 @@ ENV/
 env/
 
 # IDE
+.cursor/
 .vscode/
 .idea/
 *.swp
@@ -42,7 +43,11 @@ build/
 Thumbs.db
 
 # Project specific
+tmp/
 *.csv
 experiment_results.csv
 
 .pytest_cache/
+
+# Supabase volumes
+numex-app/supabase/volumes/

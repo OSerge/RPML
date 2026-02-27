@@ -1,0 +1,44 @@
+# Оверрайд при использовании полного self-hosted Supabase из каталога supabase/.
+# Требования: сначала запустить Supabase (cd supabase && docker compose up -d).
+#
+# В .env задать:
+#   SUPABASE_POSTGRES_PASSWORD — пароль БД из supabase/.env (POSTGRES_PASSWORD)
+#   SUPABASE_POOLER_TENANT_ID — tenant из supabase/.env (POOLER_TENANT_ID, по умолчанию your-tenant-id)
+#   SUPABASE_JWT_SECRET — тот же JWT_SECRET, что в supabase/.env
+#   VITE_SUPABASE_URL — URL Kong (с хоста, например http://localhost:8000)
+#   VITE_SUPABASE_ANON_KEY — ANON_KEY из supabase/.env
+#
+# Запуск: docker compose -f docker-compose.yml -f docker-compose.supabase-external.yml up -d
+
+services:
+  postgres:
+    profiles: [quickstart]
+
+  supabase-auth:
+    profiles: [quickstart]
+
+  backend:
+    depends_on: [redis]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres.${SUPABASE_POOLER_TENANT_ID:-your-tenant-id}:${SUPABASE_POSTGRES_PASSWORD}@supabase-pooler:5432/postgres
+      DATABASE_URL_SYNC: postgresql://postgres.${SUPABASE_POOLER_TENANT_ID:-your-tenant-id}:${SUPABASE_POSTGRES_PASSWORD}@supabase-pooler:5432/postgres
+      REDIS_URL: redis://redis:6379/0
+      SUPABASE_JWT_SECRET: ${SUPABASE_JWT_SECRET}
+      VLLM_URL: http://vllm-server:8001/v1
+    networks: [default, supabase_external]
+
+  frontend:
+    depends_on: [backend]
+    networks: [default, supabase_external]
+
+  celery-worker:
+    depends_on: [redis]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres.${SUPABASE_POOLER_TENANT_ID:-your-tenant-id}:${SUPABASE_POSTGRES_PASSWORD}@supabase-pooler:5432/postgres
+      REDIS_URL: redis://redis:6379/0
+    networks: [default, supabase_external]
+
+networks:
+  supabase_external:
+    external: true
+    name: supabase_default

@@ -1,0 +1,30 @@
+services:
+  backend:
+    build:
+      context: ..
+      dockerfile: numex-app/backend/Dockerfile
+    ports: ["8001:8000"]
+    depends_on: [redis]
+    networks:
+      - default
+      - supabase_default
+    volumes:
+      - ./backend/app:/app/repo/numex-app/backend/app:ro
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:${POSTGRES_PASSWORD}@supabase-db:5432/postgres
+      DATABASE_URL_SYNC: postgresql://postgres:${POSTGRES_PASSWORD}@supabase-db:5432/postgres
+      REDIS_URL: redis://redis:6379/0
+      SUPABASE_JWT_SECRET: ${SUPABASE_JWT_SECRET}
+      VLLM_URL: ${VLLM_URL:-http://host.docker.internal:8001/v1}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+
+networks:
+  supabase_default:
+    external: true
+
+volumes: {}
