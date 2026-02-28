@@ -1,0 +1,34 @@
+# Build context: only backend + rpml needed; exclude the rest to avoid permission errors and huge transfer
+
+.git
+*.pyc
+__pycache__
+*.egg-info
+.venv
+venv
+**/.venv
+**/venv
+.env
+.env.*
+*.log
+
+# Frontend — не нужен для backend-образа
+numex-app/frontend
+
+# Supabase volumes — данные БД, права postgres, не нужны в образе
+numex-app/supabase/volumes
+numex-app/supabase/.env
+
+# Backend: venv и кэш не нужны в образе (pip ставит свои зависимости)
+numex-app/backend/.venv
+numex-app/backend/uv.lock
+
+# Остальное в numex-app
+numex-app/node_modules
+numex-app/docker-compose*.yml
+numex-app/Makefile
+
+# RPML: тесты и лишнее
+rpml/.pytest_cache
+rpml/**/__pycache__
+rpml/**/*.pyc

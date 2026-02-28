@@ -1,15 +1,105 @@
+export type DebtType = 'credit_card' | 'mortgage' | 'consumer_loan' | 'car_loan' | 'microloan'
+export type PaymentType = 'annuity' | 'differentiated' | 'minimum_percent'
+export type PrepaymentPolicy = 'allowed' | 'prohibited' | 'with_penalty'
+
 export interface Debt {
   id: string
   name: string
+  debt_type: DebtType
+
   principal: number
   current_balance: number
   interest_rate_annual: number
+
+  payment_type: PaymentType
   min_payment_pct: number
-  late_fee_rate: number
+  fixed_payment: number | null
+
+  prepayment_policy: PrepaymentPolicy
+  prepayment_penalty_pct: number | null
+
+  late_fee_rate: number | null
   start_date: string
-  term_months: number
-  created_at?: string
-  updated_at?: string
+  term_months: number | null
+
+  credit_limit: number | null
+  grace_period_days: number | null
+}
+
+export interface DebtCreate {
+  name: string
+  debt_type: DebtType
+
+  principal: number
+  current_balance?: number
+  interest_rate_annual: number
+
+  payment_type?: PaymentType
+  min_payment_pct?: number
+  fixed_payment?: number
+
+  prepayment_policy?: PrepaymentPolicy
+  prepayment_penalty_pct?: number
+
+  late_fee_rate?: number
+  start_date: string
+  term_months?: number | null
+
+  credit_limit?: number
+  grace_period_days?: number
+}
+
+export const DEBT_TYPE_LABELS: Record<DebtType, string> = {
+  credit_card: 'Кредитная карта',
+  mortgage: 'Ипотека',
+  consumer_loan: 'Потребительский кредит',
+  car_loan: 'Автокредит',
+  microloan: 'Микрозайм',
+}
+
+export const PAYMENT_TYPE_LABELS: Record<PaymentType, string> = {
+  annuity: 'Аннуитетный',
+  differentiated: 'Дифференцированный',
+  minimum_percent: '% от остатка',
+}
+
+export const PREPAYMENT_LABELS: Record<PrepaymentPolicy, string> = {
+  allowed: 'Разрешено',
+  prohibited: 'Запрещено',
+  with_penalty: 'Со штрафом',
+}
+
+export const DEBT_TYPE_DEFAULTS: Record<DebtType, Partial<DebtCreate>> = {
+  credit_card: {
+    payment_type: 'minimum_percent',
+    prepayment_policy: 'allowed',
+    min_payment_pct: 5,
+    term_months: undefined,
+  },
+  mortgage: {
+    payment_type: 'annuity',
+    prepayment_policy: 'with_penalty',
+    min_payment_pct: 0,
+    term_months: 240,
+  },
+  consumer_loan: {
+    payment_type: 'annuity',
+    prepayment_policy: 'allowed',
+    min_payment_pct: 0,
+    term_months: 36,
+  },
+  car_loan: {
+    payment_type: 'annuity',
+    prepayment_policy: 'with_penalty',
+    min_payment_pct: 0,
+    term_months: 60,
+  },
+  microloan: {
+    payment_type: 'annuity',
+    prepayment_policy: 'allowed',
+    min_payment_pct: 0,
+    term_months: 6,
+  },
 }
 
 export interface DebtCardData {
@@ -21,20 +111,42 @@ export interface DebtCardData {
   rate: number
   nextPaymentDate: string
   minPayment: number
-  type: 'mortgage' | 'car' | 'credit_card' | 'consumer'
+  type: DebtType
 }
 
 export interface OptimizationPlan {
   id?: string
   total_cost: number
-  savings_vs_minimum: number
-  payments_matrix: Record<string, unknown>
-  explanations?: Record<string, string>
+  savings_vs_minimum: number | null
+  baseline_cost?: number
+  payments_matrix: Record<string, number[]>
+  balances_matrix?: Record<string, number[]>
+  status?: string
+  solve_time?: number
+  horizon_months?: number
   created_at?: string
 }
 
+export interface OptimizationRequest {
+  monthly_budget?: number
+  budget_by_month?: number[]
+  horizon_months?: number
+}
+
 export function mapDebtToCardData(debt: Debt): DebtCardData {
-  const monthlyPayment = Math.ceil(debt.current_balance * (debt.min_payment_pct / 100))
+  let monthlyPayment: number
+  if (debt.fixed_payment) {
+    monthlyPayment = debt.fixed_payment
+  } else if (debt.payment_type === 'minimum_percent') {
+    monthlyPayment = Math.ceil(debt.current_balance * (debt.min_payment_pct / 100))
+  } else {
+    monthlyPayment = calculateAnnuityPayment(
+      debt.current_balance,
+      debt.interest_rate_annual,
+      debt.term_months || 12
+    )
+  }
+
   const nextPaymentDate = new Date()
   nextPaymentDate.setDate(nextPaymentDate.getDate() + 30)
 
@@ -47,14 +159,17 @@ export function mapDebtToCardData(debt: Debt): DebtCardData {
     rate: debt.interest_rate_annual,
     nextPaymentDate: nextPaymentDate.toISOString().split('T')[0],
     minPayment: monthlyPayment,
-    type: inferDebtType(debt.name),
+    type: debt.debt_type,
   }
 }
 
-function inferDebtType(name: string): 'mortgage' | 'car' | 'credit_card' | 'consumer' {
-  const nameLower = name.toLowerCase()
-  if (nameLower.includes('ипотек') || nameLower.includes('mortgage')) return 'mortgage'
-  if (nameLower.includes('авто') || nameLower.includes('car')) return 'car'
-  if (nameLower.includes('карт') || nameLower.includes('card')) return 'credit_card'
-  return 'consumer'
+function calculateAnnuityPayment(principal: number, annualRate: number, termMonths: number): number {
+  const monthlyRate = Math.pow(1 + annualRate / 100, 1 / 12) - 1
+  if (monthlyRate === 0) {
+    return Math.ceil(principal / termMonths)
+  }
+  return Math.ceil(
+    principal * (monthlyRate * Math.pow(1 + monthlyRate, termMonths)) /
+    (Math.pow(1 + monthlyRate, termMonths) - 1)
+  )
 }

@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.deps import require_current_user
 from app.core.database import get_db
-from app.models.debt import Debt
+from app.models.debt import Debt, DebtType, PaymentType, PrepaymentPolicy
 from app.models.user import User
 from app.schemas.debt import DebtCreate, DebtResponse, DebtUpdate
 
@@ -19,13 +19,20 @@ def _debt_to_response(debt: Debt) -> DebtResponse:
     return DebtResponse(
         id=str(debt.id),
         name=debt.name,
+        debt_type=debt.debt_type,
         principal=float(debt.principal),
         current_balance=float(debt.current_balance),
         interest_rate_annual=float(debt.interest_rate_annual),
+        payment_type=debt.payment_type,
         min_payment_pct=float(debt.min_payment_pct),
-        late_fee_rate=float(debt.late_fee_rate),
+        fixed_payment=float(debt.fixed_payment) if debt.fixed_payment else None,
+        prepayment_policy=debt.prepayment_policy,
+        prepayment_penalty_pct=float(debt.prepayment_penalty_pct) if debt.prepayment_penalty_pct else None,
+        late_fee_rate=float(debt.late_fee_rate) if debt.late_fee_rate else None,
         start_date=debt.start_date,
         term_months=debt.term_months,
+        credit_limit=float(debt.credit_limit) if debt.credit_limit else None,
+        grace_period_days=debt.grace_period_days,
     )
 
 
@@ -48,13 +55,20 @@ async def create_debt(
     debt = Debt(
         user_id=current_user.id,
         name=data.name,
+        debt_type=DebtType(data.debt_type.value),
         principal=data.principal,
         current_balance=data.current_balance,
         interest_rate_annual=data.interest_rate_annual,
+        payment_type=PaymentType(data.payment_type.value),
         min_payment_pct=data.min_payment_pct,
+        fixed_payment=data.fixed_payment,
+        prepayment_policy=PrepaymentPolicy(data.prepayment_policy.value),
+        prepayment_penalty_pct=data.prepayment_penalty_pct,
         late_fee_rate=data.late_fee_rate,
         start_date=data.start_date,
         term_months=data.term_months,
+        credit_limit=data.credit_limit,
+        grace_period_days=data.grace_period_days,
     )
     db.add(debt)
     await db.commit()
@@ -90,10 +104,20 @@ async def update_debt(
     debt = result.scalar_one_or_none()
     if debt is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Debt not found")
-    if data.name is not None:
-        debt.name = data.name
-    if data.current_balance is not None:
-        debt.current_balance = data.current_balance
+
+    update_fields = [
+        "name", "current_balance", "interest_rate_annual", "min_payment_pct",
+        "fixed_payment", "prepayment_penalty_pct", "term_months",
+        "credit_limit", "grace_period_days",
+    ]
+    for field in update_fields:
+        value = getattr(data, field, None)
+        if value is not None:
+            setattr(debt, field, value)
+
+    if data.prepayment_policy is not None:
+        debt.prepayment_policy = PrepaymentPolicy(data.prepayment_policy.value)
+
     await db.commit()
     await db.refresh(debt)
     return _debt_to_response(debt)

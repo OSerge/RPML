@@ -1,7 +1,7 @@
 [project]
-name = "fintech-backend"
+name = "numex-backend"
 version = "0.1.0"
-description = "FinTech backend with RPML optimization"
+description = "Numex backend with RPML optimization"
 requires-python = ">=3.10"
 dependencies = [
     "rpml>=0.1.0",

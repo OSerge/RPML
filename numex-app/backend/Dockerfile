@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM python:3.12-slim
 
 WORKDIR /app
 
@@ -6,11 +6,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-COPY . /app/repo
+COPY rpml /app/repo/rpml
+COPY numex-app/backend /app/repo/numex-app/backend
+
 WORKDIR /app/repo/numex-app/backend
 
-RUN pip install --no-cache-dir -e /app/repo/rpml
-RUN pip install --no-cache-dir .
+RUN pip install --no-cache-dir -e /app/repo/rpml \
+    && pip install --no-cache-dir .
 
 EXPOSE 8000
 

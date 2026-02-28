@@ -23,10 +23,9 @@ async def get_current_user(
         return None
     token = credentials.credentials
 
-    payload = None
     if settings.supabase_jwt_secret:
         payload = decode_supabase_jwt(token)
-    if payload is None:
+    else:
         payload = decode_access_token(token)
 
     if payload is None:

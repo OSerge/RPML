@@ -1,44 +1,66 @@
-import { CreditCard, Home, Car, Wallet } from 'lucide-react'
-import type { DebtCardData } from '../types/debt'
+import { useState } from 'react'
+import { CreditCard, Home, Car, Wallet, Banknote, Plus } from 'lucide-react'
+import type { DebtCardData, DebtType } from '../types/debt'
+import { DebtForm } from './DebtForm'
 
 interface DebtCardsProps {
   debts: DebtCardData[]
 }
 
 export function DebtCards({ debts }: DebtCardsProps) {
-  const getIcon = (type: DebtCardData['type']) => {
+  const [showForm, setShowForm] = useState(false)
+
+  const getIcon = (type: DebtType) => {
     switch (type) {
       case 'mortgage':
         return Home
-      case 'car':
+      case 'car_loan':
         return Car
       case 'credit_card':
         return CreditCard
-      case 'consumer':
+      case 'consumer_loan':
+        return Wallet
+      case 'microloan':
+        return Banknote
+      default:
         return Wallet
     }
   }
 
-  const getColor = (type: DebtCardData['type']) => {
+  const getColor = (type: DebtType) => {
     switch (type) {
       case 'mortgage':
         return 'from-blue-500 to-cyan-500'
-      case 'car':
+      case 'car_loan':
         return 'from-purple-500 to-pink-500'
       case 'credit_card':
         return 'from-orange-500 to-red-500'
-      case 'consumer':
+      case 'consumer_loan':
         return 'from-green-500 to-emerald-500'
+      case 'microloan':
+        return 'from-amber-500 to-yellow-500'
+      default:
+        return 'from-slate-500 to-slate-600'
     }
   }
 
   if (debts.length === 0) {
     return (
-      <div className="bg-white dark:bg-slate-800 rounded-2xl p-8 border border-slate-200 dark:border-slate-700 text-center">
-        <p className="text-slate-500 dark:text-slate-400">
-          Нет добавленных долгов. Начните с добавления первого долга через API.
-        </p>
-      </div>
+      <>
+        <div className="bg-white dark:bg-slate-800 rounded-2xl p-8 border border-slate-200 dark:border-slate-700 text-center">
+          <p className="text-slate-500 dark:text-slate-400 mb-4">
+            Нет добавленных долгов. Добавьте первый долг для начала работы.
+          </p>
+          <button
+            onClick={() => setShowForm(true)}
+            className="inline-flex items-center gap-2 px-4 py-2 bg-gradient-to-r from-indigo-500 to-purple-600 text-white rounded-lg hover:from-indigo-600 hover:to-purple-700 transition-all"
+          >
+            <Plus className="w-5 h-5" />
+            Добавить долг
+          </button>
+        </div>
+        {showForm && <DebtForm onClose={() => setShowForm(false)} />}
+      </>
     )
   }
 
@@ -117,6 +139,20 @@ export function DebtCards({ debts }: DebtCardsProps) {
           </div>
         )
       })}
+
+      <button
+        onClick={() => setShowForm(true)}
+        className="bg-white dark:bg-slate-800 rounded-2xl p-6 border-2 border-dashed border-slate-300 dark:border-slate-600 hover:border-indigo-500 dark:hover:border-indigo-400 transition-colors flex flex-col items-center justify-center gap-2 min-h-[200px]"
+      >
+        <div className="w-12 h-12 rounded-xl bg-slate-100 dark:bg-slate-700 flex items-center justify-center">
+          <Plus className="w-6 h-6 text-slate-500 dark:text-slate-400" />
+        </div>
+        <span className="text-slate-500 dark:text-slate-400 font-medium">
+          Добавить долг
+        </span>
+      </button>
+
+      {showForm && <DebtForm onClose={() => setShowForm(false)} />}
     </div>
   )
 }

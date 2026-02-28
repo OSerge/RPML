@@ -3,6 +3,7 @@
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -13,6 +14,13 @@ from app.models.optimization_plan import OptimizationPlan
 from app.models.user import User
 
 router = APIRouter()
+
+
+class OptimizationRequest(BaseModel):
+    """Request body for optimization."""
+    monthly_budget: float = 50000.0
+    budget_by_month: list[float] | None = None
+    horizon_months: int = 24
 
 
 @router.post("/async")
@@ -64,9 +72,11 @@ async def get_optimization_result(
 
 @router.post("")
 async def run_optimization(
+    request: OptimizationRequest | None = None,
     current_user: User = Depends(require_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    """Run synchronous optimization on user debts."""
     result = await db.execute(select(Debt).where(Debt.user_id == current_user.id))
     debts = result.scalars().all()
     if not debts:
@@ -74,10 +84,19 @@ async def run_optimization(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="No debts to optimize",
         )
+
+    params = request or OptimizationRequest()
+
     from app.services.rpml_optimizer import RPMLOptimizerService
 
     service = RPMLOptimizerService()
-    plan_data = await service.optimize(debts)
+    plan_data = await service.optimize(
+        debts=list(debts),
+        monthly_budget=params.monthly_budget,
+        budget_by_month=params.budget_by_month,
+        horizon_months=params.horizon_months,
+    )
+
     plan = OptimizationPlan(
         user_id=current_user.id,
         payments_matrix=plan_data["payments_matrix"],
@@ -87,11 +106,17 @@ async def run_optimization(
     db.add(plan)
     await db.commit()
     await db.refresh(plan)
+
     return {
         "id": str(plan.id),
         "total_cost": float(plan.total_cost),
         "payments_matrix": plan_data["payments_matrix"],
+        "balances_matrix": plan_data.get("balances_matrix"),
         "savings_vs_minimum": plan_data.get("savings_vs_minimum"),
+        "baseline_cost": plan_data.get("baseline_cost"),
+        "status": plan_data.get("status"),
+        "solve_time": plan_data.get("solve_time"),
+        "horizon_months": plan_data.get("horizon_months"),
     }
 
 
