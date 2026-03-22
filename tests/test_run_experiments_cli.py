@@ -24,3 +24,21 @@ def test_parse_args_accepts_scip_flag(monkeypatch):
     args = parse_args()
 
     assert args.scip is True
+
+
+def test_parse_args_accepts_timeline_export_flags(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_experiments.py",
+            "--export-timelines",
+            "--timelines-dir",
+            "tmp/custom_timelines",
+        ],
+    )
+
+    args = parse_args()
+
+    assert args.export_timelines is True
+    assert str(args.timelines_dir).endswith("tmp/custom_timelines")

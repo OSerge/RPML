@@ -41,11 +41,11 @@ build/
 .DS_Store
 Thumbs.db
 
-# Project specific
-*.csv
-experiment_results.csv
+
 
 .pytest_cache/
+
+# Project specific
 
 tmp/
 *.aux

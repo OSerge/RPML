@@ -25,6 +25,7 @@ from rpml.metrics import (
     validate_baseline_solution,
 )
 from rpml.checkpoint import CheckpointManager
+from rpml.timeline_export import export_timeline_json
 
 
 TIMEOUT_CSV_COLUMNS = [
@@ -109,6 +110,8 @@ def run_experiments(
     skip_known_timeouts: bool = True,
     restart: bool = False,
     solver_name: str = DEFAULT_SOLVER,
+    export_timelines: bool = False,
+    timelines_dir: Path | None = None,
 ) -> List[ComparisonResult]:
     """
     Run experiments on all instances.
@@ -229,6 +232,16 @@ def run_experiments(
                     snowball_final_balance=snowball_final_balance,
                 )
 
+                if export_timelines and timelines_dir is not None:
+                    export_timeline_json(
+                        output_dir=timelines_dir,
+                        instance=instance,
+                        comparison=comparison,
+                        optimal_solution=optimal_solution,
+                        avalanche_solution=avalanche_solution,
+                        snowball_solution=snowball_solution,
+                    )
+
                 results.append(comparison)
                 if checkpoint:
                     checkpoint.save_result(comparison)
@@ -334,13 +347,34 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Use SCIP directly for all instances and disable HiGHS->SCIP fallback",
     )
+    parser.add_argument(
+        "--export-timelines",
+        action="store_true",
+        help="Export per-instance monthly trajectories to JSON files",
+    )
+    parser.add_argument(
+        "--timelines-dir",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Directory for timeline JSON files (default: tmp/timelines)",
+    )
     
     return parser.parse_args()
 
 
 def process_instance(args_tuple):
     """Process a single instance (for multiprocessing)."""
-    instance, time_limit_seconds, verbose, checkpoint_path, processed_set, solver_name = args_tuple
+    (
+        instance,
+        time_limit_seconds,
+        verbose,
+        checkpoint_path,
+        processed_set,
+        solver_name,
+        export_timelines,
+        timelines_dir_str,
+    ) = args_tuple
 
     if processed_set is not None and instance.name in processed_set:
         return ("skip_processed", instance.name)
@@ -377,6 +411,16 @@ def process_instance(args_tuple):
             snowball_final_balance=snowball_final_balance,
         )
 
+        if export_timelines and timelines_dir_str is not None:
+            export_timeline_json(
+                output_dir=Path(timelines_dir_str),
+                instance=instance,
+                comparison=comparison,
+                optimal_solution=optimal_solution,
+                avalanche_solution=avalanche_solution,
+                snowball_solution=snowball_solution,
+            )
+
         if checkpoint_path is not None:
             checkpoint = CheckpointManager(Path(str(checkpoint_path)))
             checkpoint.save_result(comparison)
@@ -402,6 +446,8 @@ def run_experiments_parallel(
     restart: bool = False,
     initial_solver_name: str = DEFAULT_SOLVER,
     enable_solver_fallback: bool = True,
+    export_timelines: bool = False,
+    timelines_dir: Path | None = None,
 ) -> List[ComparisonResult]:
     """
     Run experiments on all instances using multiprocessing.
@@ -461,8 +507,18 @@ def run_experiments_parallel(
             print(f"  (Skipped {len(known_timeouts)} known timeout instance(s))")
 
     ck_path_str = str(checkpoint_path) if checkpoint_path else None
+    timelines_dir_str = str(timelines_dir) if timelines_dir else None
     args_list = [
-        (inst, time_limit_seconds, False, ck_path_str, processed, initial_solver_name)
+        (
+            inst,
+            time_limit_seconds,
+            False,
+            ck_path_str,
+            processed,
+            initial_solver_name,
+            export_timelines,
+            timelines_dir_str,
+        )
         for inst in to_process
     ]
 
@@ -550,6 +606,8 @@ def run_experiments_parallel(
                                         ck_path_str,
                                         processed,
                                         FALLBACK_SOLVER,
+                                        export_timelines,
+                                        timelines_dir_str,
                                     )
                                     pending_args.appendleft(retry_args)
                                     if verbose:
@@ -639,6 +697,7 @@ def main():
     tmp_dir = Path(__file__).parent / "tmp"
     checkpoint_path = args.checkpoint or (tmp_dir / "experiment_results_checkpoint.jsonl")
     timeout_log_path = args.timeout_log or (tmp_dir / "timeout_instances.csv")
+    timelines_dir = args.timelines_dir or (tmp_dir / "timelines")
     initial_solver_name, enable_solver_fallback = resolve_solver_strategy(args.scip)
 
     # Handle --summary mode
@@ -680,6 +739,9 @@ def main():
         print(f"  Workers: {args.workers or 'auto (CPU count)'}")
     print(f"  Checkpoint: {checkpoint_path}")
     print(f"  Timeout log: {timeout_log_path}")
+    print(f"  Export timelines: {'yes' if args.export_timelines else 'no'}")
+    if args.export_timelines:
+        print(f"  Timelines dir: {timelines_dir}")
     print(f"  Skip known timeouts: {'no' if args.include_known_timeouts else 'yes'}")
     if args.restart:
         print("  Restart: yes (ignoring existing checkpoint)")
@@ -700,6 +762,8 @@ def main():
             restart=args.restart,
             initial_solver_name=initial_solver_name,
             enable_solver_fallback=enable_solver_fallback,
+            export_timelines=args.export_timelines,
+            timelines_dir=timelines_dir,
         )
     else:
         results = run_experiments(
@@ -713,6 +777,8 @@ def main():
             skip_known_timeouts=not args.include_known_timeouts,
             restart=args.restart,
             solver_name=initial_solver_name,
+            export_timelines=args.export_timelines,
+            timelines_dir=timelines_dir,
         )
 
     print("\n" + "=" * 60)
