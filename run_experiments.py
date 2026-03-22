@@ -5,7 +5,10 @@ Compares optimal MILP solutions with baseline strategies.
 """
 
 import argparse
+import csv
 import sys
+from contextlib import nullcontext
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List
 
@@ -13,10 +16,86 @@ import numpy as np
 from tqdm import tqdm
 
 from rpml.data_loader import load_all_instances, get_instances_by_size
-from rpml.milp_model import solve_rpml
+from rpml.milp_model import DEFAULT_SOLVER, FALLBACK_SOLVER, solve_rpml
 from rpml.baseline import debt_avalanche, debt_snowball
-from rpml.metrics import compare_solutions, print_summary, ComparisonResult
+from rpml.metrics import (
+    ComparisonResult,
+    compare_solutions,
+    print_summary,
+    validate_baseline_solution,
+)
 from rpml.checkpoint import CheckpointManager
+
+
+TIMEOUT_CSV_COLUMNS = [
+    "instance_name",
+    "n_loans",
+    "time_limit_seconds",
+    "watchdog_timeout_seconds",
+    "reason",
+    "recorded_at_utc",
+]
+
+
+def resolve_solver_strategy(use_scip: bool) -> tuple[str, bool]:
+    """Return initial solver and whether HiGHS->SCIP fallback is enabled."""
+    if use_scip:
+        return FALLBACK_SOLVER, False
+    return DEFAULT_SOLVER, True
+
+
+def load_timeout_instances(timeout_log_path: Path | None) -> set[str]:
+    """Load timed-out instance names from timeout CSV log."""
+    if timeout_log_path is None or not timeout_log_path.exists():
+        return set()
+    out: set[str] = set()
+    try:
+        with open(timeout_log_path, "r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                name = (row.get("instance_name") or "").strip()
+                if name:
+                    out.add(name)
+    except Exception:
+        # Best-effort log loading; experiment should still run.
+        return set()
+    return out
+
+
+def append_timeout_records(timeout_log_path: Path | None, records: list[dict]) -> None:
+    """Append unique timeout records to CSV log."""
+    if timeout_log_path is None or not records:
+        return
+    timeout_log_path.parent.mkdir(parents=True, exist_ok=True)
+    existing = load_timeout_instances(timeout_log_path)
+    is_new_file = not timeout_log_path.exists()
+    with open(timeout_log_path, "a", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=TIMEOUT_CSV_COLUMNS)
+        if is_new_file:
+            writer.writeheader()
+        for rec in records:
+            name = rec.get("instance_name")
+            if not name or name in existing:
+                continue
+            writer.writerow(rec)
+            existing.add(name)
+
+
+def remove_timeout_instances(timeout_log_path: Path | None, instance_names: set[str]) -> None:
+    """Remove successfully solved instances from timeout CSV log."""
+    if timeout_log_path is None or not timeout_log_path.exists() or not instance_names:
+        return
+    try:
+        with open(timeout_log_path, "r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            rows = [row for row in reader if (row.get("instance_name") or "").strip() not in instance_names]
+        with open(timeout_log_path, "w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=TIMEOUT_CSV_COLUMNS)
+            writer.writeheader()
+            writer.writerows(rows)
+    except Exception:
+        # Best-effort cleanup only.
+        return
 
 
 def run_experiments(
@@ -26,7 +105,10 @@ def run_experiments(
     verbose: bool = True,
     allowed_n_loans: tuple[int, ...] = (4, 8),
     checkpoint_path: Path | None = None,
+    timeout_log_path: Path | None = None,
+    skip_known_timeouts: bool = True,
     restart: bool = False,
+    solver_name: str = DEFAULT_SOLVER,
 ) -> List[ComparisonResult]:
     """
     Run experiments on all instances.
@@ -58,6 +140,13 @@ def run_experiments(
         else:
             print("Starting fresh (no checkpoint found or checkpoint is empty)")
 
+    known_timeouts = load_timeout_instances(timeout_log_path) if skip_known_timeouts else set()
+    if verbose and timeout_log_path:
+        if known_timeouts:
+            print(f"Skipping {len(known_timeouts)} known timeout instance(s) from: {timeout_log_path}")
+        else:
+            print(f"No known timeout instances in: {timeout_log_path}")
+
     results = []
 
     for n_loans in allowed_n_loans:
@@ -79,22 +168,52 @@ def run_experiments(
                 if verbose:
                     tqdm.write(f"Skipping {instance.name} (already processed)", file=sys.stdout)
                 continue
+            if instance.name in known_timeouts:
+                if verbose:
+                    tqdm.write(f"Skipping {instance.name} (known timeout)", file=sys.stdout)
+                continue
 
             try:
-                optimal_solution = solve_rpml(instance, time_limit_seconds=time_limit_seconds)
+                optimal_solution = solve_rpml(
+                    instance,
+                    time_limit_seconds=time_limit_seconds,
+                    solver_name=solver_name,
+                )
 
                 avalanche_solution = debt_avalanche(instance)
                 snowball_solution = debt_snowball(instance)
-                avalanche_feasible = bool(np.max(np.abs(avalanche_solution.balances[:, -1])) < 1.0)
-                snowball_feasible = bool(np.max(np.abs(snowball_solution.balances[:, -1])) < 1.0)
+                avalanche_valid, avalanche_errors, avalanche_final_balance = validate_baseline_solution(
+                    avalanche_solution, instance
+                )
+                snowball_valid, snowball_errors, snowball_final_balance = validate_baseline_solution(
+                    snowball_solution, instance
+                )
+                avalanche_feasible = avalanche_valid and avalanche_final_balance < 1.0
+                snowball_feasible = snowball_valid and snowball_final_balance < 1.0
 
                 if optimal_solution.status not in ["OPTIMAL", "FEASIBLE"]:
                     if verbose:
                         tqdm.write(f"Warning: {instance.name} MILP status: {optimal_solution.status}", file=sys.stdout)
+                if verbose and not avalanche_valid:
+                    tqdm.write(
+                        f"  {instance.name}: Debt Avalanche invalid ({'; '.join(avalanche_errors[:2])})",
+                        file=sys.stdout,
+                    )
                 if verbose and not avalanche_feasible:
-                    tqdm.write(f"  {instance.name}: Debt Avalanche infeasible (max balance: {np.max(np.abs(avalanche_solution.balances[:, -1])):,.0f})", file=sys.stdout)
+                    tqdm.write(
+                        f"  {instance.name}: Debt Avalanche not repaid by T (max balance: {avalanche_final_balance:,.0f})",
+                        file=sys.stdout,
+                    )
+                if verbose and not snowball_valid:
+                    tqdm.write(
+                        f"  {instance.name}: Debt Snowball invalid ({'; '.join(snowball_errors[:2])})",
+                        file=sys.stdout,
+                    )
                 if verbose and not snowball_feasible:
-                    tqdm.write(f"  {instance.name}: Debt Snowball infeasible (max balance: {np.max(np.abs(snowball_solution.balances[:, -1])):,.0f})", file=sys.stdout)
+                    tqdm.write(
+                        f"  {instance.name}: Debt Snowball not repaid by T (max balance: {snowball_final_balance:,.0f})",
+                        file=sys.stdout,
+                    )
 
                 comparison = compare_solutions(
                     optimal=optimal_solution,
@@ -102,13 +221,18 @@ def run_experiments(
                     snowball=snowball_solution,
                     instance_name=instance.name,
                     n_loans=n_loans,
-                    avalanche_feasible=avalanche_feasible,
-                    snowball_feasible=snowball_feasible,
+                    avalanche_valid=avalanche_valid,
+                    avalanche_repaid_by_T=avalanche_feasible,
+                    avalanche_final_balance=avalanche_final_balance,
+                    snowball_valid=snowball_valid,
+                    snowball_repaid_by_T=snowball_feasible,
+                    snowball_final_balance=snowball_final_balance,
                 )
 
                 results.append(comparison)
                 if checkpoint:
                     checkpoint.save_result(comparison)
+                remove_timeout_instances(timeout_log_path, {instance.name})
                 processed.add(instance.name)
 
             except Exception as e:
@@ -152,6 +276,13 @@ def parse_args() -> argparse.Namespace:
         metavar="SEC",
         help="Time limit for MILP solver in seconds",
     )
+    parser.add_argument(
+        "--watchdog-grace-seconds",
+        type=int,
+        default=15,
+        metavar="SEC",
+        help="Extra seconds above --time-limit before watchdog kills a stuck worker",
+    )
     
     parser.add_argument(
         "-p", "--parallel",
@@ -186,24 +317,51 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Show summary of existing checkpoint results and exit (don't run experiments)",
     )
+    parser.add_argument(
+        "--timeout-log",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Path to timeout CSV log (default: tmp/timeout_instances.csv)",
+    )
+    parser.add_argument(
+        "--include-known-timeouts",
+        action="store_true",
+        help="Process instances listed in timeout log instead of skipping them",
+    )
+    parser.add_argument(
+        "--scip",
+        action="store_true",
+        help="Use SCIP directly for all instances and disable HiGHS->SCIP fallback",
+    )
     
     return parser.parse_args()
 
 
 def process_instance(args_tuple):
     """Process a single instance (for multiprocessing)."""
-    instance, time_limit_seconds, verbose, checkpoint_path, processed_set = args_tuple
+    instance, time_limit_seconds, verbose, checkpoint_path, processed_set, solver_name = args_tuple
 
     if processed_set is not None and instance.name in processed_set:
         return ("skip_processed", instance.name)
 
     try:
-        optimal_solution = solve_rpml(instance, time_limit_seconds=time_limit_seconds)
+        optimal_solution = solve_rpml(
+            instance,
+            time_limit_seconds=time_limit_seconds,
+            solver_name=solver_name,
+        )
 
         avalanche_solution = debt_avalanche(instance)
         snowball_solution = debt_snowball(instance)
-        avalanche_feasible = bool(np.max(np.abs(avalanche_solution.balances[:, -1])) < 1.0)
-        snowball_feasible = bool(np.max(np.abs(snowball_solution.balances[:, -1])) < 1.0)
+        avalanche_valid, _, avalanche_final_balance = validate_baseline_solution(
+            avalanche_solution, instance
+        )
+        snowball_valid, _, snowball_final_balance = validate_baseline_solution(
+            snowball_solution, instance
+        )
+        avalanche_feasible = avalanche_valid and avalanche_final_balance < 1.0
+        snowball_feasible = snowball_valid and snowball_final_balance < 1.0
 
         comparison = compare_solutions(
             optimal=optimal_solution,
@@ -211,29 +369,39 @@ def process_instance(args_tuple):
             snowball=snowball_solution,
             instance_name=instance.name,
             n_loans=instance.n,
-            avalanche_feasible=avalanche_feasible,
-            snowball_feasible=snowball_feasible,
+            avalanche_valid=avalanche_valid,
+            avalanche_repaid_by_T=avalanche_feasible,
+            avalanche_final_balance=avalanche_final_balance,
+            snowball_valid=snowball_valid,
+            snowball_repaid_by_T=snowball_feasible,
+            snowball_final_balance=snowball_final_balance,
         )
 
         if checkpoint_path is not None:
             checkpoint = CheckpointManager(Path(str(checkpoint_path)))
             checkpoint.save_result(comparison)
         status = optimal_solution.status
-        return ("ok", comparison) if status in ("OPTIMAL", "FEASIBLE") else ("ok_infeasible", comparison)
+        result_kind = "ok" if status in ("OPTIMAL", "FEASIBLE") else "ok_infeasible"
+        return (result_kind, comparison, solver_name)
 
     except Exception as e:
-        return ("error", instance.name, str(e))
+        return ("error", instance.name, str(e), solver_name)
 
 
 def run_experiments_parallel(
     dataset_path: Path,
     max_instances_per_group: int = None,
     time_limit_seconds: int = 300,
+    watchdog_grace_seconds: int = 15,
     verbose: bool = True,
     allowed_n_loans: tuple[int, ...] = (4, 8),
     n_workers: int = None,
     checkpoint_path: Path | None = None,
+    timeout_log_path: Path | None = None,
+    skip_known_timeouts: bool = True,
     restart: bool = False,
+    initial_solver_name: str = DEFAULT_SOLVER,
+    enable_solver_fallback: bool = True,
 ) -> List[ComparisonResult]:
     """
     Run experiments on all instances using multiprocessing.
@@ -279,56 +447,165 @@ def run_experiments_parallel(
         else:
             print("Starting fresh (no checkpoint found or checkpoint is empty)")
 
-    to_process = [inst for inst in all_instances if inst.name not in processed]
+    known_timeouts = load_timeout_instances(timeout_log_path) if skip_known_timeouts else set()
+    to_process = [
+        inst
+        for inst in all_instances
+        if inst.name not in processed and inst.name not in known_timeouts
+    ]
     if verbose:
         print(f"\nProcessing {len(to_process)} instances in parallel...")
         if processed:
             print(f"  (Skipped {len(all_instances) - len(to_process)} already processed)")
+        if known_timeouts:
+            print(f"  (Skipped {len(known_timeouts)} known timeout instance(s))")
 
     ck_path_str = str(checkpoint_path) if checkpoint_path else None
-    args_list = [(inst, time_limit_seconds, False, ck_path_str, processed) for inst in to_process]
+    args_list = [
+        (inst, time_limit_seconds, False, ck_path_str, processed, initial_solver_name)
+        for inst in to_process
+    ]
 
     n_workers = n_workers or cpu_count()
     if verbose:
         print(f"Using {n_workers} workers")
 
-    # Per-instance timeout: MILP time limit + safety margin for baseline + overhead
-    per_instance_timeout = time_limit_seconds * 1.5 + 30
+    # External hard timeout per worker task. Keep it close to the MILP limit so
+    # a hung solver does not stall the pool much longer than requested.
+    per_instance_timeout = time_limit_seconds + watchdog_grace_seconds
 
-    from concurrent.futures import ProcessPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
-    
+    from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
+    import time
+    from collections import deque
+
+    def _kill_executor_workers(executor: ProcessPoolExecutor) -> None:
+        # Hard-stop worker processes when a solver run hangs (ignores internal limits).
+        processes = getattr(executor, "_processes", {}) or {}
+        for proc in processes.values():
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        executor.shutdown(wait=False, cancel_futures=True)
+
     raw_results = []
-    with ProcessPoolExecutor(max_workers=n_workers) as executor:
-        futures = {
-            executor.submit(process_instance, args): i
-            for i, args in enumerate(args_list)
-        }
+    pending_args = deque(args_list)
+    completed_instances = set(processed)
+    pbar_ctx = tqdm(total=len(args_list), file=sys.stdout) if verbose else nullcontext()
 
-        if verbose:
-            with tqdm(total=len(futures), file=sys.stdout) as pbar:
-                for future in as_completed(futures, timeout=per_instance_timeout):
-                    try:
-                        result = future.result(timeout=1)
-                        raw_results.append(result)
-                    except FuturesTimeoutError:
-                        idx = futures[future]
-                        inst = args_list[idx][0]
-                        raw_results.append(("error", inst.name, "Timeout exceeded"))
-                    except Exception as e:
-                        idx = futures[future]
-                        inst = args_list[idx][0]
-                        raw_results.append(("error", inst.name, str(e)))
-                    finally:
-                        pbar.update(1)
-        else:
-            for future in as_completed(futures):
+    try:
+        with pbar_ctx as pbar:
+            while pending_args:
+                executor = ProcessPoolExecutor(max_workers=n_workers)
+                inflight: dict = {}
                 try:
-                    result = future.result(timeout=1)
-                    raw_results.append(result)
-                except Exception as e:
-                    idx = futures[future]
-                    inst = args_list[idx][0]
-                    raw_results.append(("error", inst.name, str(e)))
+                    while pending_args and len(inflight) < n_workers:
+                        args = pending_args.popleft()
+                        future = executor.submit(process_instance, args)
+                        inflight[future] = (args, time.time())
+
+                    while inflight:
+                        done, _ = wait(inflight.keys(), timeout=1.0, return_when=FIRST_COMPLETED)
+
+                        # Consume completed futures first
+                        for future in done:
+                            (args, _) = inflight.pop(future)
+                            inst = args[0]
+                            try:
+                                result = future.result()
+                                raw_results.append(result)
+                                if result and result[0] in ("ok", "ok_infeasible"):
+                                    remove_timeout_instances(timeout_log_path, {inst.name})
+                                    completed_instances.add(inst.name)
+                            except Exception as e:
+                                raw_results.append(("error", inst.name, str(e)))
+                            finally:
+                                if pbar is not None:
+                                    pbar.update(1)
+
+                        # Backfill workers
+                        while pending_args and len(inflight) < n_workers:
+                            args = pending_args.popleft()
+                            future = executor.submit(process_instance, args)
+                            inflight[future] = (args, time.time())
+
+                        # Watchdog: if any task runs too long, kill the whole pool and continue.
+                        now = time.time()
+                        timed_out = [
+                            (future, args)
+                            for future, (args, started_at) in inflight.items()
+                            if (now - started_at) > per_instance_timeout
+                        ]
+                        if timed_out:
+                            timeout_names = [args[0].name for _, args in timed_out]
+                            timeout_records = []
+                            for _, args in timed_out:
+                                inst = args[0]
+                                solver_name = args[5]
+                                if enable_solver_fallback and solver_name == DEFAULT_SOLVER:
+                                    retry_args = (
+                                        inst,
+                                        time_limit_seconds,
+                                        False,
+                                        ck_path_str,
+                                        processed,
+                                        FALLBACK_SOLVER,
+                                    )
+                                    pending_args.appendleft(retry_args)
+                                    if verbose:
+                                        print(f"\nRetrying {inst.name} with {FALLBACK_SOLVER} after {DEFAULT_SOLVER} timeout")
+                                else:
+                                    raw_results.append(
+                                        ("error", inst.name, f"Watchdog timeout > {per_instance_timeout:.0f}s after {solver_name}")
+                                    )
+                                    completed_instances.add(inst.name)
+                                    timeout_records.append(
+                                        {
+                                            "instance_name": inst.name,
+                                            "n_loans": inst.n,
+                                            "time_limit_seconds": time_limit_seconds,
+                                            "watchdog_timeout_seconds": int(per_instance_timeout),
+                                            "reason": f"watchdog_timeout_after_{solver_name.lower()}",
+                                            "recorded_at_utc": datetime.now(timezone.utc).isoformat(),
+                                        }
+                                    )
+                                    if pbar is not None:
+                                        pbar.update(1)
+                            append_timeout_records(timeout_log_path, timeout_records)
+
+                            # Requeue non-timeout in-flight tasks (they were killed with the pool).
+                            for future, (args, _) in inflight.items():
+                                if args[0].name not in timeout_names:
+                                    pending_args.appendleft(args)
+                            inflight.clear()
+
+                            if verbose:
+                                print(
+                                    f"\nWatchdog: killed worker pool due to timeout on {len(timeout_names)} instance(s): "
+                                    + ", ".join(timeout_names[:3])
+                                    + ("..." if len(timeout_names) > 3 else "")
+                                )
+                            _kill_executor_workers(executor)
+                            break
+                except KeyboardInterrupt:
+                    print("\nInterrupted by user. Shutting down workers...")
+                    _kill_executor_workers(executor)
+                    raise
+                finally:
+                    try:
+                        executor.shutdown(wait=False, cancel_futures=True)
+                    except Exception:
+                        pass
+
+                # Filter out already completed args after a watchdog restart.
+                if pending_args:
+                    pending_args = deque([a for a in pending_args if a[0].name not in completed_instances])
+    except KeyboardInterrupt:
+        import os
+        # Fallback cleanup for stubborn children.
+        os.system("pkill -f 'python.*run_experiments.py' || true")
+        print("Workers terminated.")
+        sys.exit(1)
 
     for r in raw_results:
         if r is None:
@@ -361,6 +638,8 @@ def main():
 
     tmp_dir = Path(__file__).parent / "tmp"
     checkpoint_path = args.checkpoint or (tmp_dir / "experiment_results_checkpoint.jsonl")
+    timeout_log_path = args.timeout_log or (tmp_dir / "timeout_instances.csv")
+    initial_solver_name, enable_solver_fallback = resolve_solver_strategy(args.scip)
 
     # Handle --summary mode
     if args.summary:
@@ -378,7 +657,7 @@ def main():
         
         print_summary(results)
         
-        csv_path = Path(__file__).parent / "experiment_results.csv"
+        csv_path = tmp_dir / "experiment_results.csv"
         checkpoint.export_to_csv(csv_path)
         if results:
             print(f"\nResults exported to: {csv_path}")
@@ -393,10 +672,15 @@ def main():
     print(f"  Max instances per group: {args.max_instances or 'all'}")
     print(f"  Loan counts: {args.n_loans}")
     print(f"  Time limit: {args.time_limit}s")
+    print(f"  Watchdog timeout: {args.time_limit + args.watchdog_grace_seconds}s")
+    print(f"  Initial solver: {initial_solver_name}")
+    print(f"  HiGHS->SCIP fallback: {'enabled' if enable_solver_fallback else 'disabled'}")
     print(f"  Multiprocessing: {'enabled' if args.parallel else 'disabled'}")
     if args.parallel:
         print(f"  Workers: {args.workers or 'auto (CPU count)'}")
     print(f"  Checkpoint: {checkpoint_path}")
+    print(f"  Timeout log: {timeout_log_path}")
+    print(f"  Skip known timeouts: {'no' if args.include_known_timeouts else 'yes'}")
     if args.restart:
         print("  Restart: yes (ignoring existing checkpoint)")
     print()
@@ -406,11 +690,16 @@ def main():
             dataset_path=dataset_path,
             max_instances_per_group=args.max_instances,
             time_limit_seconds=args.time_limit,
+            watchdog_grace_seconds=args.watchdog_grace_seconds,
             verbose=True,
             allowed_n_loans=tuple(args.n_loans),
             n_workers=args.workers,
             checkpoint_path=checkpoint_path,
+            timeout_log_path=timeout_log_path,
+            skip_known_timeouts=not args.include_known_timeouts,
             restart=args.restart,
+            initial_solver_name=initial_solver_name,
+            enable_solver_fallback=enable_solver_fallback,
         )
     else:
         results = run_experiments(
@@ -420,18 +709,30 @@ def main():
             verbose=True,
             allowed_n_loans=tuple(args.n_loans),
             checkpoint_path=checkpoint_path,
+            timeout_log_path=timeout_log_path,
+            skip_known_timeouts=not args.include_known_timeouts,
             restart=args.restart,
+            solver_name=initial_solver_name,
         )
 
     print("\n" + "=" * 60)
     print_summary(results)
 
     checkpoint = CheckpointManager(checkpoint_path)
-    csv_path = Path(__file__).parent / "experiment_results.csv"
+    csv_path = tmp_dir / "experiment_results.csv"
     checkpoint.export_to_csv(csv_path)
     if checkpoint.load_existing_results():
         print(f"\nResults exported to: {csv_path}")
+    if timeout_log_path.exists():
+        print(f"Timeout instances logged to: {timeout_log_path}")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nInterrupted by user. Exiting...")
+        import os
+        os.system("pkill -f 'python.*run_experiments.py' || true")
+        import sys
+        sys.exit(1)

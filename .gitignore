@@ -46,3 +46,19 @@ Thumbs.db
 experiment_results.csv
 
 .pytest_cache/
+
+tmp/
+*.aux
+*.log
+*.out
+# *.pdf
+# *.tex
+*.toc
+*.lot
+*.lof
+*.lol
+*.loa
+*.lot
+*.lof
+
+reports/

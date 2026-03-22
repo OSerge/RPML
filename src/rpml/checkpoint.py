@@ -39,10 +39,16 @@ def _result_from_dict(data: dict) -> "ComparisonResult":
         optimal_gap=float(data["optimal_gap"]),
         optimal_status=str(data["optimal_status"]),
         avalanche_cost=float(data["avalanche_cost"]),
+        avalanche_valid=bool(data.get("avalanche_valid", data.get("avalanche_feasible", False))),
         avalanche_feasible=bool(data["avalanche_feasible"]),
+        avalanche_final_balance=float(data.get("avalanche_final_balance", 0.0)),
+        avalanche_horizon_spend_advantage=_float_or_none(data.get("avalanche_horizon_spend_advantage", data.get("avalanche_savings"))),
         avalanche_savings=_float_or_none(data.get("avalanche_savings")),
         snowball_cost=float(data["snowball_cost"]),
+        snowball_valid=bool(data.get("snowball_valid", data.get("snowball_feasible", False))),
         snowball_feasible=bool(data["snowball_feasible"]),
+        snowball_final_balance=float(data.get("snowball_final_balance", 0.0)),
+        snowball_horizon_spend_advantage=_float_or_none(data.get("snowball_horizon_spend_advantage", data.get("snowball_savings"))),
         snowball_savings=_float_or_none(data.get("snowball_savings")),
     )
 
@@ -146,10 +152,16 @@ class CheckpointManager:
                 "gap": r.optimal_gap,
                 "status": r.optimal_status,
                 "avalanche_cost": r.avalanche_cost,
+                "avalanche_valid": r.avalanche_valid,
                 "avalanche_feasible": r.avalanche_feasible,
+                "avalanche_final_balance": r.avalanche_final_balance,
+                "avalanche_horizon_spend_advantage": r.avalanche_horizon_spend_advantage,
                 "avalanche_savings": r.avalanche_savings,
                 "snowball_cost": r.snowball_cost,
+                "snowball_valid": r.snowball_valid,
                 "snowball_feasible": r.snowball_feasible,
+                "snowball_final_balance": r.snowball_final_balance,
+                "snowball_horizon_spend_advantage": r.snowball_horizon_spend_advantage,
                 "snowball_savings": r.snowball_savings,
             }
             for r in results

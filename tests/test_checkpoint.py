@@ -19,10 +19,16 @@ def _sample_result(name: str = "inst_4_1") -> ComparisonResult:
         optimal_gap=0.0,
         optimal_status="OPTIMAL",
         avalanche_cost=1500.0,
+        avalanche_valid=True,
         avalanche_feasible=True,
+        avalanche_final_balance=0.0,
+        avalanche_horizon_spend_advantage=33.33,
         avalanche_savings=33.33,
         snowball_cost=1600.0,
+        snowball_valid=True,
         snowball_feasible=True,
+        snowball_final_balance=0.0,
+        snowball_horizon_spend_advantage=37.5,
         snowball_savings=37.5,
     )
 
@@ -73,12 +79,16 @@ def test_corruption_recovery():
         path = Path(d) / "ck.jsonl"
         path.write_text(
             '{"instance_name":"good","n_loans":4,"optimal_cost":1.0,"optimal_solve_time":0.1,"optimal_gap":0.0,'
-            '"optimal_status":"OPTIMAL","avalanche_cost":2.0,"avalanche_feasible":true,"avalanche_savings":50.0,'
-            '"snowball_cost":2.2,"snowball_feasible":true,"snowball_savings":54.5}\n'
+            '"optimal_status":"OPTIMAL","avalanche_cost":2.0,"avalanche_valid":true,"avalanche_feasible":true,'
+            '"avalanche_final_balance":0.0,"avalanche_horizon_spend_advantage":50.0,"avalanche_savings":50.0,'
+            '"snowball_cost":2.2,"snowball_valid":true,"snowball_feasible":true,"snowball_final_balance":0.0,'
+            '"snowball_horizon_spend_advantage":54.5,"snowball_savings":54.5}\n'
             "not valid json\n"
             '{"instance_name":"good2","n_loans":4,"optimal_cost":3.0,"optimal_solve_time":0.2,"optimal_gap":0.0,'
-            '"optimal_status":"OPTIMAL","avalanche_cost":4.0,"avalanche_feasible":true,"avalanche_savings":25.0,'
-            '"snowball_cost":4.5,"snowball_feasible":true,"snowball_savings":33.3}\n',
+            '"optimal_status":"OPTIMAL","avalanche_cost":4.0,"avalanche_valid":true,"avalanche_feasible":true,'
+            '"avalanche_final_balance":0.0,"avalanche_horizon_spend_advantage":25.0,"avalanche_savings":25.0,'
+            '"snowball_cost":4.5,"snowball_valid":true,"snowball_feasible":true,"snowball_final_balance":0.0,'
+            '"snowball_horizon_spend_advantage":33.3,"snowball_savings":33.3}\n',
             encoding="utf-8",
         )
         mgr = CheckpointManager(path)
