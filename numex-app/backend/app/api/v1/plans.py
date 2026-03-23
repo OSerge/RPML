@@ -2,7 +2,7 @@
 
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -23,8 +23,28 @@ class OptimizationRequest(BaseModel):
     horizon_months: int = 24
 
 
+def _debt_to_payload(d: Debt) -> dict:
+    """Serialize Debt model to dict payload for Celery."""
+    return {
+        "id": str(d.id),
+        "name": d.name,
+        "debt_type": d.debt_type.value,
+        "current_balance": float(d.current_balance),
+        "interest_rate_annual": float(d.interest_rate_annual),
+        "payment_type": d.payment_type.value,
+        "min_payment_pct": float(d.min_payment_pct),
+        "fixed_payment": float(d.fixed_payment) if d.fixed_payment else None,
+        "prepayment_policy": d.prepayment_policy.value,
+        "prepayment_penalty_pct": float(d.prepayment_penalty_pct) if d.prepayment_penalty_pct else None,
+        "late_fee_rate": float(d.late_fee_rate or 0),
+        "term_months": d.term_months,
+        "start_date": d.start_date.isoformat(),
+    }
+
+
 @router.post("/async")
 async def run_optimization_async(
+    request: OptimizationRequest | None = None,
     current_user: User = Depends(require_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -36,19 +56,17 @@ async def run_optimization_async(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="No debts to optimize",
         )
+    
+    params = request or OptimizationRequest()
+    
     from app.tasks.optimize import run_optimization
 
     data = {
-        "debts": [
-            {
-                "name": d.name,
-                "current_balance": float(d.current_balance),
-                "interest_rate_annual": float(d.interest_rate_annual),
-                "min_payment_pct": float(d.min_payment_pct),
-            }
-            for d in debts
-        ],
-        "horizon_months": 24,
+        "user_id": str(current_user.id),
+        "debts": [_debt_to_payload(d) for d in debts],
+        "monthly_budget": params.monthly_budget,
+        "budget_by_month": params.budget_by_month,
+        "horizon_months": params.horizon_months,
     }
     task = run_optimization.delay(data)
     return {"task_id": task.id}
@@ -97,10 +115,26 @@ async def run_optimization(
         horizon_months=params.horizon_months,
     )
 
+    total_cost = plan_data["total_cost"]
+    status_val = plan_data.get("status", "")
+    if (
+        total_cost is None
+        or total_cost != total_cost
+        or total_cost == float("inf")
+        or status_val not in ("OPTIMAL", "FEASIBLE")
+    ):
+        msg = "Оптимизация не нашла допустимый план. Увеличьте бюджет или проверьте параметры долгов."
+        if status_val:
+            msg += f" (статус: {status_val})"
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=msg,
+        )
+
     plan = OptimizationPlan(
         user_id=current_user.id,
         payments_matrix=plan_data["payments_matrix"],
-        total_cost=plan_data["total_cost"],
+        total_cost=float(total_cost),
         savings_vs_minimum=plan_data.get("savings_vs_minimum"),
     )
     db.add(plan)

@@ -23,6 +23,23 @@ services:
     image: redis:7-alpine
     ports: ["6379:6379"]
 
+  celery-worker:
+    build:
+      context: ..
+      dockerfile: numex-app/backend/Dockerfile
+    command: ["celery", "-A", "app.celery_app:celery_app", "worker", "--loglevel=info"]
+    depends_on: [redis]
+    networks:
+      - default
+      - supabase_default
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:${POSTGRES_PASSWORD}@supabase-db:5432/postgres
+      DATABASE_URL_SYNC: postgresql://postgres:${POSTGRES_PASSWORD}@supabase-db:5432/postgres
+      REDIS_URL: redis://redis:6379/0
+      SUPABASE_JWT_SECRET: ${SUPABASE_JWT_SECRET}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
 networks:
   supabase_default:
     external: true

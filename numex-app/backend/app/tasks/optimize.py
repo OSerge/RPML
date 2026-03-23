@@ -1,67 +1,90 @@
 """MILP optimization task."""
 
-import numpy as np
-from rpml import RiosSolisInstance, solve_rpml
+import uuid
+
+from rpml import solve_rpml
 
 from app.celery_app import celery_app
-
-
-def _annual_to_monthly_rate(annual: float) -> float:
-    return (1 + annual / 100) ** (1 / 12) - 1
-
-
-def _build_instance_from_dict(data: dict) -> RiosSolisInstance:
-    debts = data["debts"]
-    horizon = data.get("horizon_months", 24)
-    monthly_income = data.get("monthly_income", 50000.0)
-
-    n = len(debts)
-    T = horizon
-
-    principals = np.array([float(d["current_balance"]) for d in debts])
-    monthly_rates = np.array([_annual_to_monthly_rate(float(d["interest_rate_annual"])) for d in debts])
-    interest_rates = np.tile(monthly_rates.reshape(n, 1), (1, T))
-    default_rates = np.zeros((n, T))
-    min_payment_pct = np.array([float(d["min_payment_pct"]) / 100 for d in debts])
-    prepay_penalty = np.full(n, 1e12)
-    monthly_income_arr = np.full(T, float(monthly_income))
-    release_time = np.zeros(n, dtype=int)
-    stipulated_amount = np.zeros(n)
-    fixed_payment = np.zeros(n)
-
-    return RiosSolisInstance(
-        name="user_plan",
-        n=n,
-        T=T,
-        n_cars=0,
-        n_houses=0,
-        n_credit_cards=n,
-        n_bank_loans=0,
-        principals=principals,
-        interest_rates=interest_rates,
-        default_rates=default_rates,
-        min_payment_pct=min_payment_pct,
-        prepay_penalty=prepay_penalty,
-        monthly_income=monthly_income_arr,
-        release_time=release_time,
-        stipulated_amount=stipulated_amount,
-        fixed_payment=fixed_payment,
-    )
+from app.core.database_sync import SyncSession
+from app.models.optimization_plan import OptimizationPlan
+from app.services.instance_builder import OptimizationParams, build_instance, compute_baseline_cost
 
 
 @celery_app.task(bind=True)
 def run_optimization(self, data: dict) -> dict:
-    """Run RPML optimization in Celery worker."""
-    instance = _build_instance_from_dict(data)
-    solution = solve_rpml(instance, time_limit_seconds=60)
-
-    debt_names = [d["name"] for d in data["debts"]]
-    payments_matrix = {name: solution.payments[j, :].tolist() for j, name in enumerate(debt_names)}
-
-    return {
-        "payments_matrix": payments_matrix,
-        "total_cost": float(solution.objective_value),
-        "savings_vs_minimum": None,
-        "status": solution.status,
-        "solve_time": solution.solve_time,
-    }
+    """
+    Run RPML optimization in Celery worker.
+    
+    Args:
+        data: Dict with keys:
+            - user_id: UUID string
+            - debts: List of debt payloads (dict)
+            - monthly_budget: float
+            - budget_by_month: Optional[list[float]]
+            - horizon_months: int
+            
+    Returns:
+        Dict with plan_id or error
+    """
+    try:
+        user_id = uuid.UUID(data["user_id"])
+        debts = data["debts"]
+        
+        params = OptimizationParams(
+            horizon_months=data.get("horizon_months", 24),
+            monthly_budget=data.get("monthly_budget", 50000.0),
+            budget_by_month=data.get("budget_by_month"),
+            time_limit_seconds=60,
+        )
+        
+        instance = build_instance(debts, params)
+        solution = solve_rpml(instance, time_limit_seconds=params.time_limit_seconds)
+        
+        total_cost = solution.objective_value
+        status_val = solution.status
+        
+        if (
+            total_cost is None
+            or total_cost != total_cost
+            or total_cost == float("inf")
+            or status_val not in ("OPTIMAL", "FEASIBLE")
+        ):
+            return {
+                "status": "failed",
+                "error": f"Оптимизация не нашла допустимый план (статус: {status_val})",
+            }
+        
+        debt_names = [d["name"] for d in debts]
+        payments_matrix = {
+            name: solution.payments[j, :].tolist() for j, name in enumerate(debt_names)
+        }
+        
+        baseline_cost = compute_baseline_cost(debts, params.horizon_months)
+        savings = baseline_cost - total_cost if total_cost < float("inf") else None
+        
+        with SyncSession() as db:
+            plan = OptimizationPlan(
+                user_id=user_id,
+                payments_matrix=payments_matrix,
+                total_cost=float(total_cost),
+                savings_vs_minimum=savings,
+            )
+            db.add(plan)
+            db.commit()
+            db.refresh(plan)
+            
+            plan_id = str(plan.id)
+        
+        return {
+            "status": "completed",
+            "plan_id": plan_id,
+            "total_cost": float(total_cost),
+            "savings_vs_minimum": savings,
+            "solve_time": solution.solve_time,
+        }
+        
+    except Exception as e:
+        return {
+            "status": "failed",
+            "error": str(e),
+        }

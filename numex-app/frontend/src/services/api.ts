@@ -58,13 +58,61 @@ export async function deleteDebt(id: string): Promise<void> {
   if (!res.ok) throw new Error('Failed to delete debt')
 }
 
+export class OptimizationError extends Error {
+  constructor(
+    message: string,
+    public status?: number,
+    public detail?: string
+  ) {
+    super(message)
+    this.name = 'OptimizationError'
+  }
+}
+
 export async function runOptimization(params?: OptimizationRequest): Promise<OptimizationPlan> {
   const res = await fetch(`${API_BASE}/optimize`, {
     method: 'POST',
     headers: await getAuthHeaders(),
     body: params ? JSON.stringify(params) : undefined,
   })
-  if (!res.ok) throw new Error('Optimization failed')
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}))
+    const detail = typeof body?.detail === 'string' ? body.detail : 'Оптимизация не удалась'
+    throw new OptimizationError(detail, res.status, detail)
+  }
+  return res.json()
+}
+
+export interface AsyncTaskResponse {
+  task_id: string
+}
+
+export interface AsyncTaskResult {
+  status: 'pending' | 'completed' | 'failed'
+  plan_id?: string
+  error?: string
+  result?: {
+    total_cost?: number
+    savings_vs_minimum?: number | null
+    solve_time?: number
+  }
+}
+
+export async function runOptimizationAsync(params?: OptimizationRequest): Promise<AsyncTaskResponse> {
+  const res = await fetch(`${API_BASE}/optimize/async`, {
+    method: 'POST',
+    headers: await getAuthHeaders(),
+    body: params ? JSON.stringify(params) : undefined,
+  })
+  if (!res.ok) throw new Error('Failed to start optimization')
+  return res.json()
+}
+
+export async function pollOptimizationResult(taskId: string): Promise<AsyncTaskResult> {
+  const res = await fetch(`${API_BASE}/optimize/async/${taskId}`, {
+    headers: await getAuthHeaders(),
+  })
+  if (!res.ok) throw new Error('Failed to poll task status')
   return res.json()
 }
 

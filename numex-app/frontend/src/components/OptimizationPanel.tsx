@@ -1,17 +1,64 @@
+import { useState, useEffect } from 'react'
 import { TrendingUp, Zap, Target, Info } from 'lucide-react'
 import { motion } from 'motion/react'
 import { useMutation } from '@tanstack/react-query'
-import { runOptimization } from '../services/api'
-import type { DebtCardData } from '../types/debt'
+import { runOptimizationAsync, pollOptimizationResult, getOptimizationPlan, OptimizationError } from '../services/api'
+import type { DebtCardData, OptimizationPlan } from '../types/debt'
 
 interface OptimizationPanelProps {
   debts: DebtCardData[]
 }
 
 export function OptimizationPanel({ debts }: OptimizationPanelProps) {
+  const [taskId, setTaskId] = useState<string | null>(null)
+  const [isPolling, setIsPolling] = useState(false)
+  const [plan, setPlan] = useState<OptimizationPlan | null>(null)
+  const [error, setError] = useState<string | null>(null)
+
   const optimizeMutation = useMutation({
-    mutationFn: runOptimization,
+    mutationFn: async () => {
+      const monthlyPayment = debts.reduce((s, d) => s + d.monthlyPayment, 0)
+      const monthlyBudget = Math.ceil(monthlyPayment * 1.2) || 50000
+      const response = await runOptimizationAsync({
+        monthly_budget: monthlyBudget,
+        horizon_months: 24,
+      })
+      setTaskId(response.task_id)
+      setIsPolling(true)
+      setError(null)
+      return response
+    },
+    onError: (err) => {
+      setError(err instanceof Error ? err.message : 'Ошибка при запуске оптимизации')
+    },
   })
+
+  useEffect(() => {
+    if (!taskId || !isPolling) return
+
+    const interval = setInterval(async () => {
+      try {
+        const result = await pollOptimizationResult(taskId)
+        
+        if (result.status === 'completed' && result.plan_id) {
+          const fetchedPlan = await getOptimizationPlan(result.plan_id)
+          setPlan(fetchedPlan)
+          setIsPolling(false)
+          setTaskId(null)
+        } else if (result.status === 'failed') {
+          setError(result.error || 'Оптимизация не удалась')
+          setIsPolling(false)
+          setTaskId(null)
+        }
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Ошибка polling')
+        setIsPolling(false)
+        setTaskId(null)
+      }
+    }, 2000)
+
+    return () => clearInterval(interval)
+  }, [taskId, isPolling])
 
   const sortedDebts = [...debts].sort((a, b) => b.rate - a.rate)
   const highestRateDebt = sortedDebts[0]
@@ -28,6 +75,10 @@ export function OptimizationPanel({ debts }: OptimizationPanelProps) {
 
   const monthlySavings = (highestRateDebt.remainingAmount * highestRateDebt.rate / 100) / 12
   const yearSavings = monthlySavings * 12
+  const monthlyPayment = debts.reduce((s, d) => s + d.monthlyPayment, 0)
+  const totalCost = plan?.total_cost
+  const baselineCost = plan?.baseline_cost
+  const isPending = optimizeMutation.isPending || isPolling
 
   const optimizationStrategies = [
     {
@@ -65,27 +116,38 @@ export function OptimizationPanel({ debts }: OptimizationPanelProps) {
           <h3 className="font-semibold">AI Оптимизация</h3>
         </div>
         <p className="text-indigo-100 mb-4">
-          Я проанализировал ваши долги и нашел способ сэкономить
+          RPML рассчитает оптимальный план погашения на основе ваших долгов
         </p>
-        <div className="text-3xl font-bold mb-2">{yearSavings.toLocaleString('ru-RU')} ₽</div>
-        <p className="text-sm text-indigo-100 mb-4">
-          за год при досрочном погашении {highestRateDebt.name}
-        </p>
-        <button
-          onClick={() => optimizeMutation.mutate()}
-          disabled={optimizeMutation.isPending}
-          className="w-full bg-white text-indigo-600 px-4 py-2 rounded-xl hover:bg-indigo-50 transition-colors disabled:opacity-50 font-medium"
-        >
-          {optimizeMutation.isPending ? 'Расчет...' : 'Применить план'}
-        </button>
-        {optimizeMutation.isSuccess && (
-          <p className="mt-2 text-sm text-indigo-100">
-            ✓ План создан успешно
+        {plan && typeof totalCost === 'number' ? (
+          <>
+            <div className="text-3xl font-bold mb-2">{totalCost.toLocaleString('ru-RU')} ₽</div>
+            <p className="text-sm text-indigo-100 mb-4">
+              Общая стоимость за {plan.horizon_months ?? 24} мес.
+              {plan.savings_vs_minimum != null && plan.savings_vs_minimum > 0 && baselineCost != null && (
+                <> Экономия vs минимум: {plan.savings_vs_minimum.toLocaleString('ru-RU')} ₽</>
+              )}
+            </p>
+          </>
+        ) : (
+          <p className="text-sm text-indigo-100 mb-4">
+            Бюджет: сумма платежей + 20%
           </p>
         )}
-        {optimizeMutation.isError && (
+        <button
+          onClick={() => optimizeMutation.mutate()}
+          disabled={isPending}
+          className="w-full bg-white text-indigo-600 px-4 py-2 rounded-xl hover:bg-indigo-50 transition-colors disabled:opacity-50 font-medium"
+        >
+          {isPolling ? 'Оптимизация...' : isPending ? 'Запуск...' : 'Рассчитать план'}
+        </button>
+        {plan && (
+          <p className="mt-2 text-sm text-indigo-100">
+            ✓ План создан. Статус: {plan.status ?? 'OK'}
+          </p>
+        )}
+        {error && (
           <p className="mt-2 text-sm text-red-200">
-            Ошибка при создании плана
+            {error}
           </p>
         )}
       </div>

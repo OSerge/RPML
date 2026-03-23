@@ -220,6 +220,19 @@ class RPMLModel:
                 zero_p = self.solver.Constraint(0, 0)
                 zero_p.SetCoefficient(self.P[j, t], 1.0)
         
+        # Constraint 6b: Minimum stipulated payment (annuity/installment loans)
+        # X[j,t] >= stipulated_amount[j] when loan is active (Z[j,t] = 1)
+        # Big-M formulation: X[j,t] >= stipulated - M*(1-Z)
+        # Rearranged: X[j,t] - M*Z[j,t] >= stipulated - M
+        for j in range(n):
+            stip = self.instance.stipulated_amount[j]
+            if stip > 0:
+                r_j = self.instance.release_time[j]
+                for t in range(r_j, T):
+                    min_stip = self.solver.Constraint(stip - self.M, self.solver.infinity())
+                    min_stip.SetCoefficient(self.X[j, t], 1.0)
+                    min_stip.SetCoefficient(self.Z[j, t], -self.M)
+        
         # Constraint 7: Final balance must be zero
         # B[j, T-1] = 0 for all j
         for j in range(n):
