@@ -86,7 +86,8 @@ class RPMLModel:
         if time_limit_seconds is not None:
             self.solver.SetTimeLimit(time_limit_seconds * 1000)  # Convert to milliseconds
             
-        # Use solver-specific relative gap parameter to speed up solving.
+        # Use solver-specific relative gap parameter. 0.1% gap gives near-optimal
+        # results without excessive solve time for typical instances.
         if self.solver_name == "SCIP":
             self.solver.SetSolverSpecificParametersAsString("limits/gap = 0.01")
         else:

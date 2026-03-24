@@ -8,7 +8,7 @@ from rpml.data_loader import load_instance, RiosSolisInstance
 
 def test_load_instance():
     """Test loading a single instance file."""
-    dataset_path = Path(__file__).parent.parent / "RiosSolisDataset" / "Instances" / "Instances"
+    dataset_path = Path(__file__).resolve().parents[3] / "RiosSolisDataset" / "Instances" / "Instances"
     
     # Find a 4-loan instance
     test_file = None
@@ -34,7 +34,7 @@ def test_load_instance():
 
 def test_instance_properties():
     """Test instance property calculations."""
-    dataset_path = Path(__file__).parent.parent / "RiosSolisDataset" / "Instances" / "Instances"
+    dataset_path = Path(__file__).resolve().parents[3] / "RiosSolisDataset" / "Instances" / "Instances"
     
     test_file = None
     for f in dataset_path.glob("Deudas_4_*.dat"):

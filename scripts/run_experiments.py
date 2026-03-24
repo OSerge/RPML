@@ -28,6 +28,9 @@ from rpml.checkpoint import CheckpointManager
 from rpml.timeline_export import export_timeline_json
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
 TIMEOUT_CSV_COLUMNS = [
     "instance_name",
     "n_loans",
@@ -688,13 +691,13 @@ def main():
     """Main entry point."""
     args = parse_args()
 
-    dataset_path = Path(__file__).parent / "RiosSolisDataset" / "Instances" / "Instances"
+    dataset_path = PROJECT_ROOT / "RiosSolisDataset" / "Instances" / "Instances"
 
     if not dataset_path.exists():
         print(f"Error: Dataset path not found: {dataset_path}")
         return
 
-    tmp_dir = Path(__file__).parent / "tmp"
+    tmp_dir = PROJECT_ROOT / "tmp"
     checkpoint_path = args.checkpoint or (tmp_dir / "experiment_results_checkpoint.jsonl")
     timeout_log_path = args.timeout_log or (tmp_dir / "timeout_instances.csv")
     timelines_dir = args.timelines_dir or (tmp_dir / "timelines")

@@ -11,7 +11,7 @@ from rpml.baseline import debt_avalanche, debt_snowball, debt_average
 @pytest.fixture
 def sample_instance():
     """Load a sample instance for testing."""
-    dataset_path = Path(__file__).parent.parent / "RiosSolisDataset" / "Instances" / "Instances"
+    dataset_path = Path(__file__).resolve().parents[3] / "RiosSolisDataset" / "Instances" / "Instances"
     
     test_file = None
     for f in dataset_path.glob("Deudas_4_*.dat"):
