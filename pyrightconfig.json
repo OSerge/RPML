@@ -1,0 +1,15 @@
+{
+  "venvPath": ".",
+  "venv": ".venv",
+  "extraPaths": [
+    "app/backend/src",
+    "core/rpml/src"
+  ],
+  "exclude": [
+    "**/.venv",
+    "**/__pycache__",
+    "**/.pytest_cache",
+    "**/node_modules",
+    "**/dist"
+  ]
+}

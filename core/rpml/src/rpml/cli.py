@@ -28,7 +28,7 @@ from rpml.checkpoint import CheckpointManager
 from rpml.timeline_export import export_timeline_json
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 TIMEOUT_CSV_COLUMNS = [
@@ -664,7 +664,7 @@ def run_experiments_parallel(
     except KeyboardInterrupt:
         import os
         # Fallback cleanup for stubborn children.
-        os.system("pkill -f 'python.*run_experiments.py' || true")
+        os.system("pkill -f 'run-experiments' || true")
         print("Workers terminated.")
         sys.exit(1)
 
@@ -802,6 +802,6 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\nInterrupted by user. Exiting...")
         import os
-        os.system("pkill -f 'python.*run_experiments.py' || true")
+        os.system("pkill -f 'run-experiments' || true")
         import sys
         sys.exit(1)

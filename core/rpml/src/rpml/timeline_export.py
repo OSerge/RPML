@@ -55,6 +55,35 @@ def _algorithm_block(
     return block
 
 
+
+def _decompose_payments(instance: RiosSolisInstance, sol) -> dict:
+    principal_paid = 0.0
+    interest_paid = 0.0
+    penalties_paid = 0.0
+    
+    for j in range(instance.n):
+        r_j = int(instance.release_time[j])
+        p_j = float(instance.principals[j])
+        final_b = float(sol.balances[j, -1])
+        
+        ord_int_j = 0.0
+        for t in range(r_j + 1, instance.T):
+            prev_b = p_j if t - 1 == r_j else float(max(0.0, sol.balances[j, t-1]))
+            ord_int_j += prev_b * float(instance.interest_rates[j, t])
+            
+        total_x = float(np.sum(sol.payments[j, :]))
+        pen_j = total_x - (p_j - final_b) - ord_int_j
+        
+        principal_paid += (p_j - final_b)
+        interest_paid += ord_int_j
+        penalties_paid += max(0.0, pen_j)
+        
+    return {
+        "principal": _round_money_scalar(principal_paid),
+        "interest": _round_money_scalar(interest_paid),
+        "penalties": _round_money_scalar(penalties_paid),
+    }
+
 def build_timeline_payload(
     *,
     instance: RiosSolisInstance,
@@ -94,26 +123,25 @@ def build_timeline_payload(
                 "objectiveCost": _round_money_scalar(comparison.optimal_cost),
                 "solveTimeSec": float(comparison.optimal_solve_time),
                 "gapPct": float(comparison.optimal_gap),
+                "costDecomposition": _decompose_payments(instance, optimal_solution) if comparison.optimal_status in ("OPTIMAL", "FEASIBLE") else None,
             },
             "avalanche": {
                 "totalCost": _round_money_scalar(comparison.avalanche_cost),
                 "valid": bool(comparison.avalanche_valid),
                 "feasibleByHorizon": bool(comparison.avalanche_feasible),
                 "finalBalance": _round_money_scalar(comparison.avalanche_final_balance),
-                "horizonSpendAdvantagePct": _round_money_scalar(
-                    comparison.avalanche_horizon_spend_advantage
-                ),
+                "horizonSpendAdvantagePct": _round_money_scalar(comparison.avalanche_horizon_spend_advantage),
                 "repaidOnlySavingsPct": _round_money_scalar(comparison.avalanche_savings),
+                "costDecomposition": _decompose_payments(instance, avalanche_solution),
             },
             "snowball": {
                 "totalCost": _round_money_scalar(comparison.snowball_cost),
                 "valid": bool(comparison.snowball_valid),
                 "feasibleByHorizon": bool(comparison.snowball_feasible),
                 "finalBalance": _round_money_scalar(comparison.snowball_final_balance),
-                "horizonSpendAdvantagePct": _round_money_scalar(
-                    comparison.snowball_horizon_spend_advantage
-                ),
+                "horizonSpendAdvantagePct": _round_money_scalar(comparison.snowball_horizon_spend_advantage),
                 "repaidOnlySavingsPct": _round_money_scalar(comparison.snowball_savings),
+                "costDecomposition": _decompose_payments(instance, snowball_solution),
             },
         },
         "algorithms": {

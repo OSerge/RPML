@@ -1,6 +1,6 @@
 import sys
 
-from run_experiments import parse_args, resolve_solver_strategy
+from rpml.cli import parse_args, resolve_solver_strategy
 from rpml.milp_model import DEFAULT_SOLVER, FALLBACK_SOLVER
 
 
@@ -19,7 +19,7 @@ def test_resolve_solver_strategy_uses_scip_without_fallback():
 
 
 def test_parse_args_accepts_scip_flag(monkeypatch):
-    monkeypatch.setattr(sys, "argv", ["run_experiments.py", "--scip"])
+    monkeypatch.setattr(sys, "argv", ["run-experiments", "--scip"])
 
     args = parse_args()
 
@@ -31,7 +31,7 @@ def test_parse_args_accepts_timeline_export_flags(monkeypatch):
         sys,
         "argv",
         [
-            "run_experiments.py",
+            "run-experiments",
             "--export-timelines",
             "--timelines-dir",
             "tmp/custom_timelines",

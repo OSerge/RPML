@@ -18,7 +18,7 @@ RPML/
 ├── src/rpml/           # пакет: данные, MILP, базовые стратегии, метрики, чекпоинт, экспорт траекторий
 ├── tests/              # модульные тесты
 ├── RiosSolisDataset/   # набор инстансов из статьи
-├── run_experiments.py  # CLI для пакетных экспериментов
+├── core/rpml/src/rpml/cli.py  # CLI для пакетных экспериментов
 ├── pyproject.toml
 └── README.md
 ```
@@ -55,14 +55,14 @@ avalanche_solution = debt_avalanche(instance)
 snowball_solution = debt_snowball(instance)
 ```
 
-### Эксперименты (`run_experiments.py`)
+### Эксперименты (`run-experiments`)
 
 Скрипт читает инстансы из `RiosSolisDataset/Instances/Instances`, для каждого решает MILP и считает базовые стратегии Avalanche и Snowball, сохраняет агрегированные метрики. Датасет должен лежать рядом со скриптом в ожидаемой структуре каталогов.
 
 **Базовый запуск** (последовательно, один процесс):
 
 ```bash
-uv run python run_experiments.py
+uv run run-experiments
 ```
 
 **Что по умолчанию**
@@ -96,19 +96,19 @@ uv run python run_experiments.py
 
 ```bash
 # Быстрый прогон: только 4 кредита, по 3 инстанса в группе, лимит 60 с
-uv run python run_experiments.py -n 4 -m 3 -t 60
+uv run run-experiments -n 4 -m 3 -t 60
 
 # Параллельно, 8 потоков, с экспортом траекторий для графиков
-uv run python run_experiments.py -p -w 8 --export-timelines
+uv run run-experiments -p -w 8 --export-timelines
 
 # Только SCIP, без fallback
-uv run python run_experiments.py --scip -t 120
+uv run run-experiments --scip -t 120
 
 # Сводка по уже сохранённому чекпоинту без пересчёта
-uv run python run_experiments.py --summary
+uv run run-experiments --summary
 
 # Полный пересчёт с новым чекпоинтом
-uv run python run_experiments.py --restart --checkpoint tmp/run2.jsonl
+uv run run-experiments --restart --checkpoint tmp/run2.jsonl
 ```
 
 Прерывание `Ctrl+C` в параллельном режиме завершает воркеры; при необходимости можно повторить запуск — обработанные инстансы подхватятся из чекпоинта.
