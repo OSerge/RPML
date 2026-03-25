@@ -1,0 +1,41 @@
+[build-system]
+requires = ["uv_build>=0.9.11,<0.10"]
+build-backend = "uv_build"
+
+[project]
+name = "rpml-backend"
+version = "0.1.0"
+description = "NUMEX / RPML HTTP API"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.100.0",
+    "uvicorn[standard]>=0.22.0",
+    "pydantic-settings>=2.0.0",
+    "sqlalchemy>=2.0.0",
+    "alembic>=1.13.0",
+    "bcrypt>=4.0.0",
+    "python-jose[cryptography]>=3.3.0",
+    "email-validator>=2.0.0",
+    "celery[redis]>=5.3.0",
+    "psycopg[binary]>=3.1.0",
+    "rpml",
+    "matplotlib>=3.10.8",
+]
+
+[tool.uv.sources]
+rpml = { workspace = true }
+
+[tool.uv.build-backend]
+module-name = "server"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "httpx>=0.24.0",
+    "pyyaml>=6.0.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]

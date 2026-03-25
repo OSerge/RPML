@@ -1,0 +1,800 @@
+openapi: 3.1.0
+info:
+  title: RPML Backend
+  description: 'RPML Web App HTTP API (contract snapshot: shared/contracts/openapi/rpml-web-app.v1.yaml).'
+  version: 1.0.0
+paths:
+  /health:
+    get:
+      tags:
+      - health
+      summary: Health
+      operationId: health_health_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                additionalProperties:
+                  type: string
+                type: object
+                title: Response Health Health Get
+  /api/v1/auth/login:
+    post:
+      tags:
+      - auth
+      summary: Login
+      operationId: login_api_v1_auth_login_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UserLogin'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/dashboard:
+    get:
+      tags:
+      - dashboard
+      summary: Get Dashboard
+      operationId: get_dashboard_api_v1_dashboard_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DashboardResponse'
+      security:
+      - HTTPBearer: []
+  /api/v1/demo/seed:
+    post:
+      tags:
+      - demo
+      summary: Post Demo Seed
+      operationId: post_demo_seed_api_v1_demo_seed_post
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                additionalProperties: true
+                type: object
+                title: Response Post Demo Seed Api V1 Demo Seed Post
+      security:
+      - HTTPBearer: []
+  /api/v1/debts/loan-types:
+    get:
+      tags:
+      - debts
+      summary: List Loan Types
+      operationId: list_loan_types_api_v1_debts_loan_types_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoanTypeDirectory'
+  /api/v1/debts:
+    get:
+      tags:
+      - debts
+      summary: List Debts
+      operationId: list_debts_api_v1_debts_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                items:
+                  $ref: '#/components/schemas/DebtRead'
+                type: array
+                title: Response List Debts Api V1 Debts Get
+      security:
+      - HTTPBearer: []
+    post:
+      tags:
+      - debts
+      summary: Create Debt
+      operationId: create_debt_api_v1_debts_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DebtCreate'
+        required: true
+      responses:
+        '201':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DebtRead'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - HTTPBearer: []
+  /api/v1/debts/{debt_id}:
+    get:
+      tags:
+      - debts
+      summary: Get Debt
+      operationId: get_debt_api_v1_debts__debt_id__get
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: debt_id
+        in: path
+        required: true
+        schema:
+          type: integer
+          title: Debt Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DebtRead'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+    patch:
+      tags:
+      - debts
+      summary: Update Debt
+      operationId: update_debt_api_v1_debts__debt_id__patch
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: debt_id
+        in: path
+        required: true
+        schema:
+          type: integer
+          title: Debt Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DebtUpdate'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DebtRead'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+    delete:
+      tags:
+      - debts
+      summary: Delete Debt
+      operationId: delete_debt_api_v1_debts__debt_id__delete
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: debt_id
+        in: path
+        required: true
+        schema:
+          type: integer
+          title: Debt Id
+      responses:
+        '204':
+          description: Successful Response
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/optimization/run:
+    post:
+      tags:
+      - optimization
+      summary: Run Optimization Sync
+      operationId: run_optimization_sync_api_v1_optimization_run_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OptimizationRunRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OptimizationRunResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - HTTPBearer: []
+  /api/v1/optimization/tasks:
+    post:
+      tags:
+      - optimization
+      summary: Create Optimization Task
+      operationId: create_optimization_task_api_v1_optimization_tasks_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateOptimizationTaskRequest'
+        required: true
+      responses:
+        '202':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateOptimizationTaskResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - HTTPBearer: []
+  /api/v1/optimization/tasks/{task_id}:
+    get:
+      tags:
+      - optimization
+      summary: Get Optimization Task Status
+      operationId: get_optimization_task_status_api_v1_optimization_tasks__task_id__get
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: task_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Task Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OptimizationTaskStatusResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/optimization/plans/{plan_id}:
+    get:
+      tags:
+      - optimization
+      summary: Get Optimization Plan
+      operationId: get_optimization_plan_api_v1_optimization_plans__plan_id__get
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: plan_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Plan Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OptimizationPlanResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+components:
+  schemas:
+    CreateOptimizationTaskRequest:
+      properties:
+        horizon_months:
+          type: integer
+          maximum: 240.0
+          minimum: 1.0
+          title: Horizon Months
+      type: object
+      required:
+      - horizon_months
+      title: CreateOptimizationTaskRequest
+    CreateOptimizationTaskResponse:
+      properties:
+        task_id:
+          type: string
+          title: Task Id
+        status:
+          type: string
+          const: pending
+          title: Status
+          default: pending
+      type: object
+      required:
+      - task_id
+      title: CreateOptimizationTaskResponse
+    DashboardKpis:
+      properties:
+        total_principal:
+          type: number
+          title: Total Principal
+        monthly_required_payment:
+          type: number
+          title: Monthly Required Payment
+        active_debts:
+          type: integer
+          title: Active Debts
+        last_run_status:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Last Run Status
+      type: object
+      required:
+      - total_principal
+      - monthly_required_payment
+      - active_debts
+      title: DashboardKpis
+    DashboardResponse:
+      properties:
+        kpis:
+          $ref: '#/components/schemas/DashboardKpis'
+        debts:
+          items:
+            $ref: '#/components/schemas/DebtRead'
+          type: array
+          title: Debts
+        baseline_reference:
+          anyOf:
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          title: Baseline Reference
+        last_optimization:
+          anyOf:
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          title: Last Optimization
+        scenario:
+          anyOf:
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          title: Scenario
+      type: object
+      required:
+      - kpis
+      - debts
+      title: DashboardResponse
+    DebtCreate:
+      properties:
+        name:
+          type: string
+          maxLength: 255
+          minLength: 1
+          title: Name
+        loan_type:
+          $ref: '#/components/schemas/LoanType'
+        principal:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Principal
+        fixed_payment:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Fixed Payment
+        min_payment_pct:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Min Payment Pct
+        prepay_penalty:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Prepay Penalty
+        interest_rate_monthly:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Interest Rate Monthly
+        default_rate_monthly:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Default Rate Monthly
+        stipulated_amount:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Stipulated Amount
+        release_time:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Release Time
+      type: object
+      required:
+      - name
+      - loan_type
+      title: DebtCreate
+    DebtRead:
+      properties:
+        id:
+          type: integer
+          title: Id
+        user_id:
+          type: integer
+          title: User Id
+        name:
+          type: string
+          title: Name
+        loan_type:
+          anyOf:
+          - $ref: '#/components/schemas/LoanType'
+          - type: 'null'
+        principal:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Principal
+        fixed_payment:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Fixed Payment
+        min_payment_pct:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Min Payment Pct
+        prepay_penalty:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Prepay Penalty
+        interest_rate_monthly:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Interest Rate Monthly
+        default_rate_monthly:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Default Rate Monthly
+        stipulated_amount:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Stipulated Amount
+        release_time:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Release Time
+      type: object
+      required:
+      - id
+      - user_id
+      - name
+      title: DebtRead
+    DebtUpdate:
+      properties:
+        name:
+          anyOf:
+          - type: string
+            maxLength: 255
+            minLength: 1
+          - type: 'null'
+          title: Name
+        loan_type:
+          anyOf:
+          - $ref: '#/components/schemas/LoanType'
+          - type: 'null'
+        principal:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Principal
+        fixed_payment:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Fixed Payment
+        min_payment_pct:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Min Payment Pct
+        prepay_penalty:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Prepay Penalty
+        interest_rate_monthly:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Interest Rate Monthly
+        default_rate_monthly:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Default Rate Monthly
+        stipulated_amount:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Stipulated Amount
+        release_time:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Release Time
+      type: object
+      title: DebtUpdate
+    HTTPValidationError:
+      properties:
+        detail:
+          items:
+            $ref: '#/components/schemas/ValidationError'
+          type: array
+          title: Detail
+      type: object
+      title: HTTPValidationError
+    LoanType:
+      type: string
+      enum:
+      - car_loan
+      - house_loan
+      - credit_card
+      - bank_loan
+      title: LoanType
+    LoanTypeDirectory:
+      properties:
+        supported_values:
+          items:
+            type: string
+          type: array
+          title: Supported Values
+      type: object
+      title: LoanTypeDirectory
+    OptimizationPlanResponse:
+      properties:
+        status:
+          type: string
+          title: Status
+        total_cost:
+          type: number
+          title: Total Cost
+        payments_matrix:
+          items:
+            items:
+              type: number
+            type: array
+          type: array
+          title: Payments Matrix
+        input_mode:
+          type: string
+          title: Input Mode
+          default: scenario_snapshot
+        assumptions:
+          items:
+            type: string
+          type: array
+          title: Assumptions
+      type: object
+      required:
+      - status
+      - total_cost
+      - payments_matrix
+      title: OptimizationPlanResponse
+    OptimizationRunRequest:
+      properties:
+        horizon_months:
+          type: integer
+          maximum: 240.0
+          minimum: 1.0
+          title: Horizon Months
+      type: object
+      required:
+      - horizon_months
+      title: OptimizationRunRequest
+    OptimizationRunResponse:
+      properties:
+        status:
+          type: string
+          title: Status
+        total_cost:
+          type: number
+          title: Total Cost
+        payments_matrix:
+          items:
+            items:
+              type: number
+            type: array
+          type: array
+          title: Payments Matrix
+        balances_matrix:
+          items:
+            items:
+              type: number
+            type: array
+          type: array
+          title: Balances Matrix
+        horizon_months:
+          type: integer
+          title: Horizon Months
+        baseline_comparison:
+          additionalProperties: true
+          type: object
+          title: Baseline Comparison
+        input_mode:
+          type: string
+          const: scenario_snapshot
+          title: Input Mode
+          default: scenario_snapshot
+        assumptions:
+          items:
+            type: string
+          type: array
+          title: Assumptions
+      type: object
+      required:
+      - status
+      - total_cost
+      - payments_matrix
+      - balances_matrix
+      - horizon_months
+      - baseline_comparison
+      title: OptimizationRunResponse
+    OptimizationTaskStatusResponse:
+      properties:
+        status:
+          type: string
+          enum:
+          - pending
+          - completed
+          - failed
+          title: Status
+        task_id:
+          type: string
+          title: Task Id
+        plan_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Plan Id
+        error:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Error
+      type: object
+      required:
+      - status
+      - task_id
+      title: OptimizationTaskStatusResponse
+    TokenResponse:
+      properties:
+        access_token:
+          type: string
+          title: Access Token
+        token_type:
+          type: string
+          title: Token Type
+          default: bearer
+      type: object
+      required:
+      - access_token
+      title: TokenResponse
+    UserLogin:
+      properties:
+        email:
+          type: string
+          format: email
+          title: Email
+        password:
+          type: string
+          title: Password
+      type: object
+      required:
+      - email
+      - password
+      title: UserLogin
+    ValidationError:
+      properties:
+        loc:
+          items:
+            anyOf:
+            - type: string
+            - type: integer
+          type: array
+          title: Location
+        msg:
+          type: string
+          title: Message
+        type:
+          type: string
+          title: Error Type
+        input:
+          title: Input
+        ctx:
+          type: object
+          title: Context
+      type: object
+      required:
+      - loc
+      - msg
+      - type
+      title: ValidationError
+    ErrorResponse:
+      type: object
+      required:
+      - detail
+      title: ErrorResponse
+      properties:
+        detail:
+          description: 'Error detail: string from HTTPException or list for validation
+            errors.'
+          oneOf:
+          - type: string
+          - type: array
+            items: {}
+  securitySchemes:
+    HTTPBearer:
+      type: http
+      scheme: bearer
+  responses:
+    ErrorContent:
+      description: Error body for many 4xx/5xx responses (HTTPException).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
