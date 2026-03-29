@@ -6,6 +6,8 @@ Compares optimal MILP solutions with baseline strategies.
 
 import argparse
 import csv
+import dataclasses
+import json
 import sys
 from contextlib import nullcontext
 from datetime import datetime, timezone
@@ -20,11 +22,19 @@ from rpml.milp_model import DEFAULT_SOLVER, FALLBACK_SOLVER, solve_rpml
 from rpml.baseline import debt_avalanche, debt_snowball
 from rpml.metrics import (
     ComparisonResult,
+    MonteCarloAggregateResult,
+    aggregate_monte_carlo_results,
     compare_solutions,
     print_summary,
     validate_baseline_solution,
 )
 from rpml.checkpoint import CheckpointManager
+from rpml.income_monte_carlo import (
+    IncomeMCConfig,
+    derive_instance_seed,
+    replace_instance_income,
+    simulate_income_paths,
+)
 from rpml.timeline_export import export_timeline_json
 
 
@@ -40,12 +50,76 @@ TIMEOUT_CSV_COLUMNS = [
     "recorded_at_utc",
 ]
 
+MC_INSTANCE_CSV_COLUMNS = [
+    "instance_name",
+    "n_loans",
+    "n_scenarios",
+    "feasible_scenarios",
+    "infeasible_scenarios",
+    "infeasible_rate",
+    "mean_cost",
+    "median_cost",
+    "p90_cost",
+    "mean_solve_time",
+    "p90_solve_time",
+    "p95_required_budget_overrun_proxy",
+]
+
+MC_SCENARIO_CSV_COLUMNS = [
+    "instance_name",
+    "scenario_name",
+    "scenario_index",
+    "status",
+    "objective_cost",
+    "solve_time",
+    "gap",
+]
+
 
 def resolve_solver_strategy(use_scip: bool) -> tuple[str, bool]:
     """Return initial solver and whether HiGHS->SCIP fallback is enabled."""
     if use_scip:
         return FALLBACK_SOLVER, False
     return DEFAULT_SOLVER, True
+
+
+def _serialize_mc_config(config: IncomeMCConfig) -> dict:
+    return dataclasses.asdict(config)
+
+
+def _write_mc_outputs(
+    output_path: Path,
+    aggregates: list[MonteCarloAggregateResult],
+    scenario_rows: list[dict],
+    config: IncomeMCConfig,
+) -> tuple[Path, Path, Path]:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    scenario_path = output_path.with_name(f"{output_path.stem}_scenarios{output_path.suffix}")
+    metadata_path = output_path.with_name(f"{output_path.stem}_meta.json")
+
+    with open(output_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=MC_INSTANCE_CSV_COLUMNS)
+        writer.writeheader()
+        for item in aggregates:
+            writer.writerow(dataclasses.asdict(item))
+
+    with open(scenario_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=MC_SCENARIO_CSV_COLUMNS)
+        writer.writeheader()
+        writer.writerows(scenario_rows)
+
+    metadata = {
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "income_mc_config": _serialize_mc_config(config),
+        "aggregates_file": str(output_path),
+        "scenarios_file": str(scenario_path),
+        "instance_count": len(aggregates),
+        "scenario_count": len(scenario_rows),
+    }
+    with open(metadata_path, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, ensure_ascii=False, indent=2)
+
+    return output_path, scenario_path, metadata_path
 
 
 def load_timeout_instances(timeout_log_path: Path | None) -> set[str]:
@@ -261,6 +335,84 @@ def run_experiments(
     return results
 
 
+def run_monte_carlo_experiments(
+    dataset_path: Path,
+    mc_config: IncomeMCConfig,
+    max_instances_per_group: int = None,
+    time_limit_seconds: int = 300,
+    verbose: bool = True,
+    allowed_n_loans: tuple[int, ...] = (4, 8),
+    solver_name: str = DEFAULT_SOLVER,
+) -> tuple[list[MonteCarloAggregateResult], list[dict]]:
+    if verbose:
+        print("Loading instances...")
+
+    instances = load_all_instances(dataset_path)
+    grouped = get_instances_by_size(instances)
+
+    if verbose:
+        print(f"Loaded {len(instances)} instances")
+        for n, group in grouped.items():
+            print(f"  {n} loans: {len(group)} instances")
+
+    aggregates: list[MonteCarloAggregateResult] = []
+    scenario_rows: list[dict] = []
+
+    for n_loans in allowed_n_loans:
+        group_instances = grouped.get(n_loans, [])
+
+        if not group_instances:
+            continue
+
+        if max_instances_per_group:
+            group_instances = group_instances[:max_instances_per_group]
+
+        if verbose:
+            print(f"\nProcessing {n_loans}-loan instances ({len(group_instances)} instances) with Monte Carlo...")
+
+        iterator = tqdm(group_instances, file=sys.stdout) if verbose else group_instances
+
+        for instance in iterator:
+            try:
+                instance_seed = derive_instance_seed(mc_config.seed, instance.name)
+                instance_mc_config = dataclasses.replace(mc_config, seed=instance_seed)
+                incomes = simulate_income_paths(instance.monthly_income, instance_mc_config)
+
+                scenario_solutions = []
+                for idx, scenario_income in enumerate(incomes):
+                    scenario_instance = replace_instance_income(instance, scenario_income, str(idx))
+                    solution = solve_rpml(
+                        scenario_instance,
+                        time_limit_seconds=time_limit_seconds,
+                        solver_name=solver_name,
+                    )
+                    scenario_solutions.append(solution)
+                    scenario_rows.append(
+                        {
+                            "instance_name": instance.name,
+                            "scenario_name": scenario_instance.name,
+                            "scenario_index": idx,
+                            "status": solution.status,
+                            "objective_cost": solution.objective_value,
+                            "solve_time": solution.solve_time,
+                            "gap": solution.gap,
+                        }
+                    )
+
+                aggregate = aggregate_monte_carlo_results(
+                    instance_name=instance.name,
+                    n_loans=instance.n,
+                    scenario_solutions=scenario_solutions,
+                )
+                aggregates.append(aggregate)
+            except Exception as e:
+                if verbose:
+                    print(f"\nError processing {instance.name}: {e}")
+                continue
+
+    return aggregates, scenario_rows
+
+
 def parse_args() -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
@@ -361,6 +513,60 @@ def parse_args() -> argparse.Namespace:
         default=None,
         metavar="PATH",
         help="Directory for timeline JSON files (default: tmp/timelines)",
+    )
+    parser.add_argument(
+        "--mc-income",
+        action="store_true",
+        help="Enable Monte Carlo simulation mode for monthly income scenarios",
+    )
+    parser.add_argument(
+        "--mc-scenarios",
+        type=int,
+        default=16,
+        metavar="N",
+        help="Number of Monte Carlo scenarios per instance",
+    )
+    parser.add_argument(
+        "--mc-seed",
+        type=int,
+        default=42,
+        metavar="N",
+        help="Base seed for Monte Carlo scenario generation",
+    )
+    parser.add_argument(
+        "--mc-rho",
+        type=float,
+        default=0.55,
+        metavar="RHO",
+        help="AR(1) correlation for Monte Carlo income shocks",
+    )
+    parser.add_argument(
+        "--mc-sigma",
+        type=float,
+        default=0.15,
+        metavar="SIGMA",
+        help="Log-scale volatility for Monte Carlo income shocks",
+    )
+    parser.add_argument(
+        "--mc-shock-prob",
+        type=float,
+        default=0.04,
+        metavar="P",
+        help="Per-month probability of negative income shock",
+    )
+    parser.add_argument(
+        "--mc-shock-severity",
+        type=float,
+        default=0.30,
+        metavar="S",
+        help="Mean severity of negative income shock in [0, 1]",
+    )
+    parser.add_argument(
+        "--mc-output",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="CSV path for Monte Carlo aggregated results (default: tmp/mc_income_results.csv)",
     )
     
     return parser.parse_args()
@@ -745,10 +951,66 @@ def main():
     print(f"  Export timelines: {'yes' if args.export_timelines else 'no'}")
     if args.export_timelines:
         print(f"  Timelines dir: {timelines_dir}")
+    print(f"  Monte Carlo income mode: {'yes' if args.mc_income else 'no'}")
+    if args.mc_income:
+        print(f"  MC scenarios: {args.mc_scenarios}")
+        print(f"  MC seed: {args.mc_seed}")
+        print(f"  MC rho: {args.mc_rho}")
+        print(f"  MC sigma: {args.mc_sigma}")
+        print(f"  MC shock prob: {args.mc_shock_prob}")
+        print(f"  MC shock severity: {args.mc_shock_severity}")
     print(f"  Skip known timeouts: {'no' if args.include_known_timeouts else 'yes'}")
     if args.restart:
         print("  Restart: yes (ignoring existing checkpoint)")
     print()
+
+    if args.mc_income:
+        mc_output_path = args.mc_output or (tmp_dir / "mc_income_results.csv")
+        mc_config = IncomeMCConfig(
+            n_scenarios=args.mc_scenarios,
+            seed=args.mc_seed,
+            rho=args.mc_rho,
+            sigma=args.mc_sigma,
+            shock_prob=args.mc_shock_prob,
+            shock_severity_mean=args.mc_shock_severity,
+            shock_severity_std=max(args.mc_shock_severity * 0.25, 0.01),
+            min_income_floor=1.0,
+        )
+        mc_config.validate()
+
+        if args.parallel:
+            print("Warning: --parallel is currently ignored in --mc-income mode; running sequentially.")
+
+        aggregates, scenario_rows = run_monte_carlo_experiments(
+            dataset_path=dataset_path,
+            mc_config=mc_config,
+            max_instances_per_group=args.max_instances,
+            time_limit_seconds=args.time_limit,
+            verbose=True,
+            allowed_n_loans=tuple(args.n_loans),
+            solver_name=initial_solver_name,
+        )
+        instance_csv, scenario_csv, metadata_json = _write_mc_outputs(
+            output_path=mc_output_path,
+            aggregates=aggregates,
+            scenario_rows=scenario_rows,
+            config=mc_config,
+        )
+
+        print("\n" + "=" * 60)
+        print("MONTE CARLO INCOME SUMMARY")
+        print("=" * 60)
+        print(f"Instances processed: {len(aggregates)}")
+        if aggregates:
+            avg_infeasible = float(np.mean([r.infeasible_rate for r in aggregates]))
+            avg_cost = float(np.mean([r.mean_cost for r in aggregates if np.isfinite(r.mean_cost)]))
+            print(f"Average infeasible rate: {avg_infeasible:.3f}")
+            if np.isfinite(avg_cost):
+                print(f"Average mean cost: {avg_cost:,.2f}")
+        print(f"MC aggregate CSV: {instance_csv}")
+        print(f"MC scenario CSV: {scenario_csv}")
+        print(f"MC metadata JSON: {metadata_json}")
+        return
 
     if args.parallel:
         results = run_experiments_parallel(

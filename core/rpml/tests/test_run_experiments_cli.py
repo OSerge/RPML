@@ -42,3 +42,39 @@ def test_parse_args_accepts_timeline_export_flags(monkeypatch):
 
     assert args.export_timelines is True
     assert str(args.timelines_dir).endswith("tmp/custom_timelines")
+
+
+def test_parse_args_accepts_monte_carlo_flags(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run-experiments",
+            "--mc-income",
+            "--mc-scenarios",
+            "24",
+            "--mc-seed",
+            "123",
+            "--mc-rho",
+            "0.7",
+            "--mc-sigma",
+            "0.2",
+            "--mc-shock-prob",
+            "0.05",
+            "--mc-shock-severity",
+            "0.4",
+            "--mc-output",
+            "tmp/mc.csv",
+        ],
+    )
+
+    args = parse_args()
+
+    assert args.mc_income is True
+    assert args.mc_scenarios == 24
+    assert args.mc_seed == 123
+    assert args.mc_rho == 0.7
+    assert args.mc_sigma == 0.2
+    assert args.mc_shock_prob == 0.05
+    assert args.mc_shock_severity == 0.4
+    assert str(args.mc_output).endswith("tmp/mc.csv")

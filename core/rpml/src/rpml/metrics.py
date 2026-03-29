@@ -34,6 +34,24 @@ class ComparisonResult:
     snowball_savings: Optional[float]
 
 
+@dataclass
+class MonteCarloAggregateResult:
+    """Aggregated Monte Carlo metrics for one base instance."""
+
+    instance_name: str
+    n_loans: int
+    n_scenarios: int
+    feasible_scenarios: int
+    infeasible_scenarios: int
+    infeasible_rate: float
+    mean_cost: float
+    median_cost: float
+    p90_cost: float
+    mean_solve_time: float
+    p90_solve_time: float
+    p95_required_budget_overrun_proxy: float
+
+
 def relative_savings(optimal_cost: float, baseline_cost: float) -> Optional[float]:
     """
     Calculate relative savings percentage (MILP vs baseline).
@@ -44,6 +62,50 @@ def relative_savings(optimal_cost: float, baseline_cost: float) -> Optional[floa
     if baseline_cost <= 0:
         return None
     return (baseline_cost - optimal_cost) / baseline_cost * 100.0
+
+
+def aggregate_monte_carlo_results(
+    instance_name: str,
+    n_loans: int,
+    scenario_solutions: list[RPMLSolution],
+) -> MonteCarloAggregateResult:
+    if not scenario_solutions:
+        raise ValueError("scenario_solutions must not be empty")
+
+    scenario_count = len(scenario_solutions)
+    feasible = [s for s in scenario_solutions if s.status in ("OPTIMAL", "FEASIBLE")]
+    feasible_count = len(feasible)
+    infeasible_count = scenario_count - feasible_count
+    infeasible_rate = float(infeasible_count / scenario_count)
+
+    if feasible_count > 0:
+        costs = np.array([s.objective_value for s in feasible], dtype=float)
+        mean_cost = float(np.mean(costs))
+        median_cost = float(np.median(costs))
+        p90_cost = float(np.percentile(costs, 90))
+    else:
+        mean_cost = float("inf")
+        median_cost = float("inf")
+        p90_cost = float("inf")
+
+    solve_times = np.array([s.solve_time for s in scenario_solutions], dtype=float)
+    mean_solve_time = float(np.mean(solve_times))
+    p90_solve_time = float(np.percentile(solve_times, 90))
+
+    return MonteCarloAggregateResult(
+        instance_name=instance_name,
+        n_loans=n_loans,
+        n_scenarios=scenario_count,
+        feasible_scenarios=feasible_count,
+        infeasible_scenarios=infeasible_count,
+        infeasible_rate=infeasible_rate,
+        mean_cost=mean_cost,
+        median_cost=median_cost,
+        p90_cost=p90_cost,
+        mean_solve_time=mean_solve_time,
+        p90_solve_time=p90_solve_time,
+        p95_required_budget_overrun_proxy=infeasible_rate,
+    )
 
 
 def validate_baseline_solution(solution: BaselineSolution, instance) -> tuple[bool, list[str], float]:

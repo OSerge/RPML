@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from rpml.data_loader import RiosSolisInstance
+from rpml.income_monte_carlo import replace_instance_income
 from rpml.milp_model import solve_rpml
 
 
@@ -103,4 +104,14 @@ def test_milp_allows_activation_after_release_month():
     assert np.sum(solution.payments[0, 1:]) > 0.0
     assert solution.balances[0, 1] > 0.0
     assert solution.balances[0, -1] == pytest.approx(0.0, abs=1e-3)
+
+
+def test_milp_solves_with_replaced_income_vector(simple_instance):
+    scenario_income = np.array([180.0, 210.0, 195.0])
+    scenario_instance = replace_instance_income(simple_instance, scenario_income, "smoke")
+
+    solution = solve_rpml(scenario_instance, time_limit_seconds=10)
+
+    assert solution.status in ("OPTIMAL", "FEASIBLE")
+    assert solution.payments.shape == (scenario_instance.n, scenario_instance.T)
 
