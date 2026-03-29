@@ -17,7 +17,7 @@ from server.services.demo_seed import (
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-SAMPLE_JSON = REPO_ROOT / "docs" / "result_samples" / "Deudas_4_0_0_2_2_120_fijo_fijo_0.json"
+SAMPLE_JSON = REPO_ROOT / "core" / "rpml" / "result_samples" / "Deudas_4_0_0_2_2_120_fijo_fijo_0.json"
 DEMO_SCENARIO_CODE = "Deudas_4_0_0_2_2_120_fijo_fijo_0"
 EXPECTED_INTEREST_RATES = [
     0.007004809170188,

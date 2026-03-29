@@ -71,7 +71,7 @@ def _repo_root() -> Path:
 
 
 def default_seed_json_path() -> Path:
-    return _repo_root() / "docs" / "result_samples" / "Deudas_4_0_0_2_2_120_fijo_fijo_0.json"
+    return _repo_root() / "core" / "rpml" / "result_samples" / "Deudas_4_0_0_2_2_120_fijo_fijo_0.json"
 
 
 def debt_name_prefix_for_scenario(code: str) -> str:
@@ -80,7 +80,7 @@ def debt_name_prefix_for_scenario(code: str) -> str:
 
 
 def _bundled_demo_codes() -> set[str]:
-    samples_dir = _repo_root() / "docs" / "result_samples"
+    samples_dir = _repo_root() / "core" / "rpml" / "result_samples"
     return {path.stem for path in samples_dir.glob("Deudas_*.json")}
 
 

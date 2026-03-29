@@ -54,13 +54,13 @@ infra-health: ## Check infra health (Postgres + Redis)
 	@bash "$(ROOT_DIR)/infra/scripts/check-health.sh"
 
 migrate: ## Run backend migrations
-	@uv --project "$(ROOT_DIR)" run --package rpml-backend alembic upgrade head
+	@cd "$(BACKEND_DIR)" && uv --project "$(ROOT_DIR)" run --package rpml-backend alembic upgrade head
 
 seed-user: ## Create a local demo user for login
-	@DEMO_EMAIL="$(DEMO_EMAIL)" DEMO_PASSWORD="$(DEMO_PASSWORD)" uv --project "$(ROOT_DIR)" run --package rpml-backend python -c "import os; from server.infrastructure.auth.password import hash_password; from server.infrastructure.db.models.user import UserORM; from server.infrastructure.db.session import SessionLocal; email=os.environ['DEMO_EMAIL']; password=os.environ['DEMO_PASSWORD']; db=SessionLocal(); user=db.query(UserORM).filter_by(email=email).first(); db.add(UserORM(email=email, hashed_password=hash_password(password))) if user is None else None; db.commit() if user is None else None; print(f'created demo user: {email}' if user is None else f'demo user already exists: {email}'); db.close()"
+	@cd "$(BACKEND_DIR)" && DEMO_EMAIL="$(DEMO_EMAIL)" DEMO_PASSWORD="$(DEMO_PASSWORD)" uv --project "$(ROOT_DIR)" run --package rpml-backend python -c "import os; from server.infrastructure.auth.password import hash_password; from server.infrastructure.db.models.user import UserORM; from server.infrastructure.db.session import SessionLocal; email=os.environ['DEMO_EMAIL']; password=os.environ['DEMO_PASSWORD']; db=SessionLocal(); user=db.query(UserORM).filter_by(email=email).first(); db.add(UserORM(email=email, hashed_password=hash_password(password))) if user is None else None; db.commit() if user is None else None; print(f'created demo user: {email}' if user is None else f'demo user already exists: {email}'); db.close()"
 
 demo-seed: ## Load idempotent demo scenario (same as POST /api/v1/demo/seed)
-	@DEMO_EMAIL="$(DEMO_EMAIL)" uv --project "$(ROOT_DIR)" run --package rpml-backend python -m server.services.demo_seed
+	@cd "$(BACKEND_DIR)" && DEMO_EMAIL="$(DEMO_EMAIL)" uv --project "$(ROOT_DIR)" run --package rpml-backend python -m server.services.demo_seed
 
 demo-reset: demo-seed ## Re-apply demo seed (idempotent alias)
 
