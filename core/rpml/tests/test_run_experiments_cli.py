@@ -4,8 +4,16 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
-from rpml.cli import main, parse_args, resolve_solver_strategy, run_monte_carlo_experiments
+from rpml.cli import (
+    main,
+    parse_args,
+    process_monte_carlo_instance,
+    resolve_solver_strategy,
+    run_monte_carlo_experiments,
+    run_monte_carlo_experiments_parallel,
+)
 from rpml.income_monte_carlo import IncomeMCConfig
 from rpml.metrics import ComparisonResult, MonteCarloAggregateResult
 from rpml.milp_model import DEFAULT_SOLVER, FALLBACK_SOLVER
@@ -260,3 +268,349 @@ def test_main_mc_income_prints_baseline_summary(monkeypatch, capsys, tmp_path):
     assert "MONTE CARLO BASELINE COMPARISON SUMMARY" in out
     assert "Debt Avalanche: valid 1, repaid_by_T 1, not_repaid_by_T 0" in out
     assert "Debt Snowball: valid 1, repaid_by_T 1, not_repaid_by_T 0" in out
+
+
+def test_main_mc_income_parallel_uses_parallel_runner(monkeypatch, capsys, tmp_path):
+    dataset_path = tmp_path / "RiosSolisDataset" / "Instances" / "Instances"
+    dataset_path.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr("rpml.cli.PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(
+        "rpml.cli.parse_args",
+        lambda: Namespace(
+            checkpoint=None,
+            timeout_log=None,
+            timelines_dir=None,
+            scip=False,
+            summary=False,
+            max_instances=None,
+            n_loans=[4],
+            time_limit=1,
+            watchdog_grace_seconds=1,
+            parallel=True,
+            workers=2,
+            export_timelines=False,
+            mc_income=True,
+            mc_scenarios=2,
+            mc_seed=42,
+            mc_rho=0.55,
+            mc_sigma=0.15,
+            mc_shock_prob=0.04,
+            mc_shock_severity=0.30,
+            mc_output=None,
+            include_known_timeouts=False,
+            restart=False,
+        ),
+    )
+
+    def _sequential_should_not_be_called(**kwargs):
+        raise AssertionError("Sequential MC runner must not be called when parallel=True")
+
+    monkeypatch.setattr("rpml.cli.run_monte_carlo_experiments", _sequential_should_not_be_called)
+
+    called = {"parallel": False}
+
+    def _parallel_runner(**kwargs):
+        called["parallel"] = True
+        return (
+            [
+                MonteCarloAggregateResult(
+                    instance_name="inst_a",
+                    n_loans=4,
+                    n_scenarios=2,
+                    feasible_scenarios=2,
+                    infeasible_scenarios=0,
+                    infeasible_rate=0.0,
+                    mean_cost=950.0,
+                    median_cost=950.0,
+                    p90_cost=960.0,
+                    mean_solve_time=0.2,
+                    p90_solve_time=0.3,
+                    p95_required_budget_overrun_proxy=0.0,
+                )
+            ],
+            [{"instance_name": "inst_a", "scenario_name": "inst_a__mc_0", "scenario_index": 0}],
+            [
+                ComparisonResult(
+                    instance_name="inst_a__mc_0",
+                    n_loans=4,
+                    optimal_cost=950.0,
+                    optimal_solve_time=0.2,
+                    optimal_gap=0.0,
+                    optimal_status="OPTIMAL",
+                    avalanche_cost=1000.0,
+                    avalanche_valid=True,
+                    avalanche_feasible=True,
+                    avalanche_final_balance=0.0,
+                    avalanche_horizon_spend_advantage=5.0,
+                    avalanche_savings=5.0,
+                    snowball_cost=1100.0,
+                    snowball_valid=True,
+                    snowball_feasible=True,
+                    snowball_final_balance=0.0,
+                    snowball_horizon_spend_advantage=13.64,
+                    snowball_savings=13.64,
+                )
+            ],
+        )
+
+    monkeypatch.setattr("rpml.cli.run_monte_carlo_experiments_parallel", _parallel_runner)
+    monkeypatch.setattr(
+        "rpml.cli._write_mc_outputs",
+        lambda **kwargs: (
+            tmp_path / "tmp" / "mc_income_results.csv",
+            tmp_path / "tmp" / "mc_income_results_scenarios.csv",
+            tmp_path / "tmp" / "mc_income_results_meta.json",
+        ),
+    )
+
+    main()
+    out = capsys.readouterr().out
+
+    assert called["parallel"] is True
+    assert "MONTE CARLO INCOME SUMMARY" in out
+
+
+def test_process_monte_carlo_instance_returns_instance_payload(monkeypatch):
+    instance = SimpleNamespace(name="inst_a", n=4, monthly_income=np.array([100.0, 100.0]))
+    monkeypatch.setattr("rpml.cli.derive_instance_seed", lambda base_seed, instance_name: 11)
+    monkeypatch.setattr(
+        "rpml.cli.simulate_income_paths",
+        lambda base_income, cfg: np.array([[100.0, 100.0], [90.0, 110.0]], dtype=float),
+    )
+    monkeypatch.setattr(
+        "rpml.cli.replace_instance_income",
+        lambda src, income, suffix: SimpleNamespace(
+            name=f"{src.name}__mc_{suffix}",
+            n=src.n,
+            monthly_income=np.array(income, dtype=float),
+        ),
+    )
+    monkeypatch.setattr(
+        "rpml.cli.solve_rpml",
+        lambda scenario_instance, **kwargs: SimpleNamespace(
+            status="OPTIMAL", objective_value=900.0, solve_time=0.2, gap=0.0
+        ),
+    )
+    monkeypatch.setattr("rpml.cli.debt_avalanche", lambda scenario_instance: SimpleNamespace(total_cost=1000.0))
+    monkeypatch.setattr("rpml.cli.debt_snowball", lambda scenario_instance: SimpleNamespace(total_cost=1100.0))
+    monkeypatch.setattr("rpml.cli.validate_baseline_solution", lambda solution, instance: (True, [], 0.0))
+    monkeypatch.setattr(
+        "rpml.cli.compare_solutions",
+        lambda **kwargs: ComparisonResult(
+            instance_name=kwargs["instance_name"],
+            n_loans=kwargs["n_loans"],
+            optimal_cost=900.0,
+            optimal_solve_time=0.2,
+            optimal_gap=0.0,
+            optimal_status="OPTIMAL",
+            avalanche_cost=1000.0,
+            avalanche_valid=True,
+            avalanche_feasible=True,
+            avalanche_final_balance=0.0,
+            avalanche_horizon_spend_advantage=10.0,
+            avalanche_savings=10.0,
+            snowball_cost=1100.0,
+            snowball_valid=True,
+            snowball_feasible=True,
+            snowball_final_balance=0.0,
+            snowball_horizon_spend_advantage=18.0,
+            snowball_savings=18.0,
+        ),
+    )
+    monkeypatch.setattr(
+        "rpml.cli.aggregate_monte_carlo_results",
+        lambda **kwargs: MonteCarloAggregateResult(
+            instance_name=kwargs["instance_name"],
+            n_loans=kwargs["n_loans"],
+            n_scenarios=2,
+            feasible_scenarios=2,
+            infeasible_scenarios=0,
+            infeasible_rate=0.0,
+            mean_cost=900.0,
+            median_cost=900.0,
+            p90_cost=900.0,
+            mean_solve_time=0.2,
+            p90_solve_time=0.2,
+            p95_required_budget_overrun_proxy=0.0,
+        ),
+    )
+
+    result = process_monte_carlo_instance(
+        (instance, IncomeMCConfig(n_scenarios=2, seed=1), 1, DEFAULT_SOLVER)
+    )
+
+    assert result[0] == "ok"
+    assert result[1].instance_name == "inst_a"
+    assert len(result[2]) == 2
+    assert len(result[3]) == 2
+
+
+def test_run_monte_carlo_experiments_parallel_merges_results_deterministically(monkeypatch):
+    inst_b = SimpleNamespace(name="inst_b", n=4, monthly_income=np.array([100.0, 100.0]))
+    inst_a = SimpleNamespace(name="inst_a", n=4, monthly_income=np.array([100.0, 100.0]))
+    monkeypatch.setattr("rpml.cli.load_all_instances", lambda _: [inst_b, inst_a])
+    monkeypatch.setattr("rpml.cli.get_instances_by_size", lambda _: {4: [inst_b, inst_a]})
+
+    def _fake_worker(args_tuple):
+        inst = args_tuple[0]
+        rows = [
+            {"instance_name": inst.name, "scenario_name": f"{inst.name}__mc_1", "scenario_index": 1},
+            {"instance_name": inst.name, "scenario_name": f"{inst.name}__mc_0", "scenario_index": 0},
+        ]
+        comps = [
+            ComparisonResult(
+                instance_name=f"{inst.name}__mc_1",
+                n_loans=4,
+                optimal_cost=1.0,
+                optimal_solve_time=1.0,
+                optimal_gap=0.0,
+                optimal_status="OPTIMAL",
+                avalanche_cost=1.0,
+                avalanche_valid=True,
+                avalanche_feasible=True,
+                avalanche_final_balance=0.0,
+                avalanche_horizon_spend_advantage=0.0,
+                avalanche_savings=0.0,
+                snowball_cost=1.0,
+                snowball_valid=True,
+                snowball_feasible=True,
+                snowball_final_balance=0.0,
+                snowball_horizon_spend_advantage=0.0,
+                snowball_savings=0.0,
+            ),
+            ComparisonResult(
+                instance_name=f"{inst.name}__mc_0",
+                n_loans=4,
+                optimal_cost=1.0,
+                optimal_solve_time=1.0,
+                optimal_gap=0.0,
+                optimal_status="OPTIMAL",
+                avalanche_cost=1.0,
+                avalanche_valid=True,
+                avalanche_feasible=True,
+                avalanche_final_balance=0.0,
+                avalanche_horizon_spend_advantage=0.0,
+                avalanche_savings=0.0,
+                snowball_cost=1.0,
+                snowball_valid=True,
+                snowball_feasible=True,
+                snowball_final_balance=0.0,
+                snowball_horizon_spend_advantage=0.0,
+                snowball_savings=0.0,
+            ),
+        ]
+        aggregate = MonteCarloAggregateResult(
+            instance_name=inst.name,
+            n_loans=4,
+            n_scenarios=2,
+            feasible_scenarios=2,
+            infeasible_scenarios=0,
+            infeasible_rate=0.0,
+            mean_cost=1.0,
+            median_cost=1.0,
+            p90_cost=1.0,
+            mean_solve_time=1.0,
+            p90_solve_time=1.0,
+            p95_required_budget_overrun_proxy=0.0,
+        )
+        return ("ok", aggregate, rows, comps)
+
+    monkeypatch.setattr("rpml.cli.process_monte_carlo_instance", _fake_worker)
+
+    class _FakeFuture:
+        def __init__(self, value):
+            self._value = value
+
+        def result(self):
+            return self._value
+
+    class _FakeExecutor:
+        def __init__(self, max_workers=None):
+            self.max_workers = max_workers
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def submit(self, fn, args):
+            return _FakeFuture(fn(args))
+
+    monkeypatch.setattr("rpml.cli.futures.ProcessPoolExecutor", _FakeExecutor)
+    monkeypatch.setattr("rpml.cli.futures.as_completed", lambda iterable: list(reversed(list(iterable))))
+
+    aggregates, scenario_rows, scenario_comparisons = run_monte_carlo_experiments_parallel(
+        dataset_path=Path("/tmp/unused"),
+        mc_config=IncomeMCConfig(n_scenarios=2, seed=1),
+        max_instances_per_group=None,
+        verbose=False,
+        allowed_n_loans=(4,),
+        n_workers=2,
+    )
+
+    assert [item.instance_name for item in aggregates] == ["inst_a", "inst_b"]
+    assert [(row["instance_name"], row["scenario_index"]) for row in scenario_rows] == [
+        ("inst_a", 0),
+        ("inst_a", 1),
+        ("inst_b", 0),
+        ("inst_b", 1),
+    ]
+    assert [item.instance_name for item in scenario_comparisons] == [
+        "inst_a__mc_0",
+        "inst_a__mc_1",
+        "inst_b__mc_0",
+        "inst_b__mc_1",
+    ]
+
+
+def test_run_monte_carlo_experiments_parallel_keyboard_interrupt_kills_workers(monkeypatch):
+    inst_a = SimpleNamespace(name="inst_a", n=4, monthly_income=np.array([100.0, 100.0]))
+    monkeypatch.setattr("rpml.cli.load_all_instances", lambda _: [inst_a])
+    monkeypatch.setattr("rpml.cli.get_instances_by_size", lambda _: {4: [inst_a]})
+
+    killed = {"flag": False}
+    shutdown_called = {"flag": False}
+
+    class _FakeProc:
+        def kill(self):
+            killed["flag"] = True
+
+    class _FakeFuture:
+        pass
+
+    class _FakeExecutor:
+        def __init__(self, max_workers=None):
+            self._processes = {1: _FakeProc()}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def submit(self, fn, args):
+            return _FakeFuture()
+
+        def shutdown(self, wait=False, cancel_futures=True):
+            shutdown_called["flag"] = True
+
+    monkeypatch.setattr("rpml.cli.futures.ProcessPoolExecutor", _FakeExecutor)
+
+    def _raise_interrupt(_futures):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr("rpml.cli.futures.as_completed", _raise_interrupt)
+
+    with pytest.raises(KeyboardInterrupt):
+        run_monte_carlo_experiments_parallel(
+            dataset_path=Path("/tmp/unused"),
+            mc_config=IncomeMCConfig(n_scenarios=2, seed=1),
+            max_instances_per_group=None,
+            verbose=False,
+            allowed_n_loans=(4,),
+            n_workers=2,
+        )
+
+    assert killed["flag"] is True
+    assert shutdown_called["flag"] is True

@@ -5,6 +5,7 @@ Compares optimal MILP solutions with baseline strategies.
 """
 
 import argparse
+import concurrent.futures as futures
 import csv
 import dataclasses
 import json
@@ -352,8 +353,12 @@ def run_monte_carlo_experiments(
 
     if verbose:
         print(f"Loaded {len(instances)} instances")
-        for n, group in grouped.items():
-            print(f"  {n} loans: {len(group)} instances")
+        print(f"  Selected loan counts: {list(allowed_n_loans)}")
+        for n_loans in allowed_n_loans:
+            group_instances = grouped.get(n_loans, [])
+            if max_instances_per_group:
+                group_instances = group_instances[:max_instances_per_group]
+            print(f"  {n_loans} loans (selected): {len(group_instances)} instances")
 
     aggregates: list[MonteCarloAggregateResult] = []
     scenario_rows: list[dict] = []
@@ -375,67 +380,220 @@ def run_monte_carlo_experiments(
 
         for instance in iterator:
             try:
-                instance_seed = derive_instance_seed(mc_config.seed, instance.name)
-                instance_mc_config = dataclasses.replace(mc_config, seed=instance_seed)
-                incomes = simulate_income_paths(instance.monthly_income, instance_mc_config)
-
-                scenario_solutions = []
-                for idx, scenario_income in enumerate(incomes):
-                    scenario_instance = replace_instance_income(instance, scenario_income, str(idx))
-                    solution = solve_rpml(
-                        scenario_instance,
-                        time_limit_seconds=time_limit_seconds,
-                        solver_name=solver_name,
-                    )
-                    scenario_solutions.append(solution)
-                    scenario_rows.append(
-                        {
-                            "instance_name": instance.name,
-                            "scenario_name": scenario_instance.name,
-                            "scenario_index": idx,
-                            "status": solution.status,
-                            "objective_cost": solution.objective_value,
-                            "solve_time": solution.solve_time,
-                            "gap": solution.gap,
-                        }
-                    )
-                    avalanche_solution = debt_avalanche(scenario_instance)
-                    snowball_solution = debt_snowball(scenario_instance)
-                    avalanche_valid, _, avalanche_final_balance = validate_baseline_solution(
-                        avalanche_solution, scenario_instance
-                    )
-                    snowball_valid, _, snowball_final_balance = validate_baseline_solution(
-                        snowball_solution, scenario_instance
-                    )
-                    avalanche_feasible = avalanche_valid and avalanche_final_balance < 1.0
-                    snowball_feasible = snowball_valid and snowball_final_balance < 1.0
-                    scenario_comparisons.append(
-                        compare_solutions(
-                            optimal=solution,
-                            avalanche=avalanche_solution,
-                            snowball=snowball_solution,
-                            instance_name=scenario_instance.name,
-                            n_loans=n_loans,
-                            avalanche_valid=avalanche_valid,
-                            avalanche_repaid_by_T=avalanche_feasible,
-                            avalanche_final_balance=avalanche_final_balance,
-                            snowball_valid=snowball_valid,
-                            snowball_repaid_by_T=snowball_feasible,
-                            snowball_final_balance=snowball_final_balance,
-                        )
-                    )
-
-                aggregate = aggregate_monte_carlo_results(
-                    instance_name=instance.name,
-                    n_loans=instance.n,
-                    scenario_solutions=scenario_solutions,
+                aggregate, instance_rows, instance_comparisons = _run_monte_carlo_for_instance(
+                    instance=instance,
+                    mc_config=mc_config,
+                    time_limit_seconds=time_limit_seconds,
+                    solver_name=solver_name,
                 )
                 aggregates.append(aggregate)
+                scenario_rows.extend(instance_rows)
+                scenario_comparisons.extend(instance_comparisons)
             except Exception as e:
                 if verbose:
                     print(f"\nError processing {instance.name}: {e}")
                 continue
 
+    _sort_monte_carlo_outputs(aggregates, scenario_rows, scenario_comparisons)
+    return aggregates, scenario_rows, scenario_comparisons
+
+
+def _run_monte_carlo_for_instance(
+    *,
+    instance,
+    mc_config: IncomeMCConfig,
+    time_limit_seconds: int,
+    solver_name: str,
+) -> tuple[MonteCarloAggregateResult, list[dict], list[ComparisonResult]]:
+    instance_seed = derive_instance_seed(mc_config.seed, instance.name)
+    instance_mc_config = dataclasses.replace(mc_config, seed=instance_seed)
+    incomes = simulate_income_paths(instance.monthly_income, instance_mc_config)
+
+    scenario_solutions = []
+    scenario_rows: list[dict] = []
+    scenario_comparisons: list[ComparisonResult] = []
+    for idx, scenario_income in enumerate(incomes):
+        scenario_instance = replace_instance_income(instance, scenario_income, str(idx))
+        solution = solve_rpml(
+            scenario_instance,
+            time_limit_seconds=time_limit_seconds,
+            solver_name=solver_name,
+        )
+        scenario_solutions.append(solution)
+        scenario_rows.append(
+            {
+                "instance_name": instance.name,
+                "scenario_name": scenario_instance.name,
+                "scenario_index": idx,
+                "status": solution.status,
+                "objective_cost": solution.objective_value,
+                "solve_time": solution.solve_time,
+                "gap": solution.gap,
+            }
+        )
+        avalanche_solution = debt_avalanche(scenario_instance)
+        snowball_solution = debt_snowball(scenario_instance)
+        avalanche_valid, _, avalanche_final_balance = validate_baseline_solution(
+            avalanche_solution, scenario_instance
+        )
+        snowball_valid, _, snowball_final_balance = validate_baseline_solution(
+            snowball_solution, scenario_instance
+        )
+        avalanche_feasible = avalanche_valid and avalanche_final_balance < 1.0
+        snowball_feasible = snowball_valid and snowball_final_balance < 1.0
+        scenario_comparisons.append(
+            compare_solutions(
+                optimal=solution,
+                avalanche=avalanche_solution,
+                snowball=snowball_solution,
+                instance_name=scenario_instance.name,
+                n_loans=instance.n,
+                avalanche_valid=avalanche_valid,
+                avalanche_repaid_by_T=avalanche_feasible,
+                avalanche_final_balance=avalanche_final_balance,
+                snowball_valid=snowball_valid,
+                snowball_repaid_by_T=snowball_feasible,
+                snowball_final_balance=snowball_final_balance,
+            )
+        )
+
+    aggregate = aggregate_monte_carlo_results(
+        instance_name=instance.name,
+        n_loans=instance.n,
+        scenario_solutions=scenario_solutions,
+    )
+    return aggregate, scenario_rows, scenario_comparisons
+
+
+def process_monte_carlo_instance(args_tuple):
+    """
+    Process one base instance in Monte Carlo mode (for multiprocessing).
+    """
+    instance, mc_config, time_limit_seconds, solver_name = args_tuple
+    try:
+        aggregate, scenario_rows, scenario_comparisons = _run_monte_carlo_for_instance(
+            instance=instance,
+            mc_config=mc_config,
+            time_limit_seconds=time_limit_seconds,
+            solver_name=solver_name,
+        )
+        return ("ok", aggregate, scenario_rows, scenario_comparisons)
+    except Exception as e:
+        return ("error", instance.name, str(e))
+
+
+def _scenario_name_sort_key(name: str) -> tuple[str, int, str]:
+    if "__mc_" in name:
+        base, suffix = name.rsplit("__mc_", 1)
+        if suffix.isdigit():
+            return (base, int(suffix), name)
+    return (name, 10**9, name)
+
+
+def _sort_monte_carlo_outputs(
+    aggregates: list[MonteCarloAggregateResult],
+    scenario_rows: list[dict],
+    scenario_comparisons: list[ComparisonResult],
+) -> None:
+    aggregates.sort(key=lambda item: item.instance_name)
+    scenario_rows.sort(
+        key=lambda row: (
+            row.get("instance_name", ""),
+            int(row.get("scenario_index", 0)),
+            row.get("scenario_name", ""),
+        )
+    )
+    scenario_comparisons.sort(key=lambda item: _scenario_name_sort_key(item.instance_name))
+
+
+def run_monte_carlo_experiments_parallel(
+    dataset_path: Path,
+    mc_config: IncomeMCConfig,
+    max_instances_per_group: int = None,
+    time_limit_seconds: int = 300,
+    verbose: bool = True,
+    allowed_n_loans: tuple[int, ...] = (4, 8),
+    solver_name: str = DEFAULT_SOLVER,
+    n_workers: int | None = None,
+) -> tuple[list[MonteCarloAggregateResult], list[dict], list[ComparisonResult]]:
+    from multiprocessing import cpu_count
+
+    if verbose:
+        print("Loading instances...")
+
+    instances = load_all_instances(dataset_path)
+    grouped = get_instances_by_size(instances)
+
+    if verbose:
+        print(f"Loaded {len(instances)} instances")
+        print(f"  Selected loan counts: {list(allowed_n_loans)}")
+        for n_loans in allowed_n_loans:
+            group_instances = grouped.get(n_loans, [])
+            if max_instances_per_group:
+                group_instances = group_instances[:max_instances_per_group]
+            print(f"  {n_loans} loans (selected): {len(group_instances)} instances")
+
+    all_instances = []
+    for n_loans in allowed_n_loans:
+        group_instances = grouped.get(n_loans, [])
+        if not group_instances:
+            continue
+        if max_instances_per_group:
+            group_instances = group_instances[:max_instances_per_group]
+        all_instances.extend(group_instances)
+
+    if verbose:
+        print(f"\nProcessing {len(all_instances)} instances in parallel with Monte Carlo...")
+
+    args_list = [
+        (instance, mc_config, time_limit_seconds, solver_name)
+        for instance in all_instances
+    ]
+
+    worker_count = n_workers or cpu_count()
+    if verbose:
+        print(f"Using {worker_count} workers")
+
+    aggregates: list[MonteCarloAggregateResult] = []
+    scenario_rows: list[dict] = []
+    scenario_comparisons: list[ComparisonResult] = []
+    executor = None
+
+    def _kill_executor_workers(current_executor) -> None:
+        processes = getattr(current_executor, "_processes", {}) or {}
+        for proc in processes.values():
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        try:
+            current_executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+
+    pbar_ctx = tqdm(total=len(args_list), file=sys.stdout) if verbose else nullcontext()
+    try:
+        with pbar_ctx as pbar:
+            with futures.ProcessPoolExecutor(max_workers=worker_count) as executor:
+                submitted = [executor.submit(process_monte_carlo_instance, args) for args in args_list]
+                for future in futures.as_completed(submitted):
+                    result = future.result()
+                    if result and result[0] == "ok":
+                        aggregates.append(result[1])
+                        scenario_rows.extend(result[2])
+                        scenario_comparisons.extend(result[3])
+                    elif result and result[0] == "error" and verbose:
+                        print(f"Error processing {result[1]}: {result[2]}")
+                    if pbar is not None:
+                        pbar.update(1)
+    except KeyboardInterrupt:
+        if verbose:
+            print("\nInterrupted by user. Shutting down Monte Carlo workers...")
+        if executor is not None:
+            _kill_executor_workers(executor)
+        raise
+
+    _sort_monte_carlo_outputs(aggregates, scenario_rows, scenario_comparisons)
     return aggregates, scenario_rows, scenario_comparisons
 
 
@@ -1005,17 +1163,26 @@ def main():
         mc_config.validate()
 
         if args.parallel:
-            print("Warning: --parallel is currently ignored in --mc-income mode; running sequentially.")
-
-        aggregates, scenario_rows, scenario_comparisons = run_monte_carlo_experiments(
-            dataset_path=dataset_path,
-            mc_config=mc_config,
-            max_instances_per_group=args.max_instances,
-            time_limit_seconds=args.time_limit,
-            verbose=True,
-            allowed_n_loans=tuple(args.n_loans),
-            solver_name=initial_solver_name,
-        )
+            aggregates, scenario_rows, scenario_comparisons = run_monte_carlo_experiments_parallel(
+                dataset_path=dataset_path,
+                mc_config=mc_config,
+                max_instances_per_group=args.max_instances,
+                time_limit_seconds=args.time_limit,
+                verbose=True,
+                allowed_n_loans=tuple(args.n_loans),
+                solver_name=initial_solver_name,
+                n_workers=args.workers,
+            )
+        else:
+            aggregates, scenario_rows, scenario_comparisons = run_monte_carlo_experiments(
+                dataset_path=dataset_path,
+                mc_config=mc_config,
+                max_instances_per_group=args.max_instances,
+                time_limit_seconds=args.time_limit,
+                verbose=True,
+                allowed_n_loans=tuple(args.n_loans),
+                solver_name=initial_solver_name,
+            )
         instance_csv, scenario_csv, metadata_json = _write_mc_outputs(
             output_path=mc_output_path,
             aggregates=aggregates,
