@@ -343,7 +343,7 @@ def run_monte_carlo_experiments(
     verbose: bool = True,
     allowed_n_loans: tuple[int, ...] = (4, 8),
     solver_name: str = DEFAULT_SOLVER,
-) -> tuple[list[MonteCarloAggregateResult], list[dict]]:
+) -> tuple[list[MonteCarloAggregateResult], list[dict], list[ComparisonResult]]:
     if verbose:
         print("Loading instances...")
 
@@ -357,6 +357,7 @@ def run_monte_carlo_experiments(
 
     aggregates: list[MonteCarloAggregateResult] = []
     scenario_rows: list[dict] = []
+    scenario_comparisons: list[ComparisonResult] = []
 
     for n_loans in allowed_n_loans:
         group_instances = grouped.get(n_loans, [])
@@ -398,6 +399,31 @@ def run_monte_carlo_experiments(
                             "gap": solution.gap,
                         }
                     )
+                    avalanche_solution = debt_avalanche(scenario_instance)
+                    snowball_solution = debt_snowball(scenario_instance)
+                    avalanche_valid, _, avalanche_final_balance = validate_baseline_solution(
+                        avalanche_solution, scenario_instance
+                    )
+                    snowball_valid, _, snowball_final_balance = validate_baseline_solution(
+                        snowball_solution, scenario_instance
+                    )
+                    avalanche_feasible = avalanche_valid and avalanche_final_balance < 1.0
+                    snowball_feasible = snowball_valid and snowball_final_balance < 1.0
+                    scenario_comparisons.append(
+                        compare_solutions(
+                            optimal=solution,
+                            avalanche=avalanche_solution,
+                            snowball=snowball_solution,
+                            instance_name=scenario_instance.name,
+                            n_loans=n_loans,
+                            avalanche_valid=avalanche_valid,
+                            avalanche_repaid_by_T=avalanche_feasible,
+                            avalanche_final_balance=avalanche_final_balance,
+                            snowball_valid=snowball_valid,
+                            snowball_repaid_by_T=snowball_feasible,
+                            snowball_final_balance=snowball_final_balance,
+                        )
+                    )
 
                 aggregate = aggregate_monte_carlo_results(
                     instance_name=instance.name,
@@ -410,7 +436,7 @@ def run_monte_carlo_experiments(
                     print(f"\nError processing {instance.name}: {e}")
                 continue
 
-    return aggregates, scenario_rows
+    return aggregates, scenario_rows, scenario_comparisons
 
 
 def parse_args() -> argparse.Namespace:
@@ -981,7 +1007,7 @@ def main():
         if args.parallel:
             print("Warning: --parallel is currently ignored in --mc-income mode; running sequentially.")
 
-        aggregates, scenario_rows = run_monte_carlo_experiments(
+        aggregates, scenario_rows, scenario_comparisons = run_monte_carlo_experiments(
             dataset_path=dataset_path,
             mc_config=mc_config,
             max_instances_per_group=args.max_instances,
@@ -1010,6 +1036,10 @@ def main():
         print(f"MC aggregate CSV: {instance_csv}")
         print(f"MC scenario CSV: {scenario_csv}")
         print(f"MC metadata JSON: {metadata_json}")
+        if scenario_comparisons:
+            print("\n" + "=" * 60)
+            print("MONTE CARLO BASELINE COMPARISON SUMMARY")
+            print_summary(scenario_comparisons)
         return
 
     if args.parallel:
