@@ -10,10 +10,11 @@ import csv
 import dataclasses
 import hashlib
 import json
+import os
 import re
 import signal
 import sys
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, List
@@ -105,6 +106,32 @@ def _install_shutdown_signal_handlers() -> dict[int, Any]:
 def _restore_shutdown_signal_handlers(previous_handlers: dict[int, Any]) -> None:
     for sig, handler in previous_handlers.items():
         signal.signal(sig, handler)
+
+
+@contextmanager
+def _suppress_native_solver_output(enabled: bool = True):
+    if not enabled:
+        yield
+        return
+    try:
+        saved_stdout_fd = os.dup(1)
+        saved_stderr_fd = os.dup(2)
+        devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    except OSError:
+        yield
+        return
+    try:
+        os.dup2(devnull_fd, 1)
+        os.dup2(devnull_fd, 2)
+        yield
+    finally:
+        try:
+            os.dup2(saved_stdout_fd, 1)
+            os.dup2(saved_stderr_fd, 2)
+        finally:
+            os.close(saved_stdout_fd)
+            os.close(saved_stderr_fd)
+            os.close(devnull_fd)
 
 
 def _json_ready(value: Any) -> Any:
@@ -659,6 +686,7 @@ def _run_monte_carlo_for_instance(
     checkpoint_path: Path | str | None = None,
     existing_scenario_results: dict[int, ComparisonResult] | None = None,
     ru_mode: bool = False,
+    suppress_solver_output: bool = False,
 ) -> tuple[MonteCarloAggregateResult, list[dict], list[ComparisonResult]]:
     instance_seed = derive_instance_seed(mc_config.seed, instance.name)
     instance_mc_config = dataclasses.replace(mc_config, seed=instance_seed)
@@ -686,12 +714,13 @@ def _run_monte_carlo_for_instance(
             continue
         scenario_instance = replace_instance_income(instance, scenario_income, str(idx))
         baseline_instance = with_ru_prepayment_rules(scenario_instance) if ru_mode else scenario_instance
-        solution = solve_rpml(
-            scenario_instance,
-            time_limit_seconds=time_limit_seconds,
-            solver_name=solver_name,
-            ru_mode=ru_mode,
-        )
+        with _suppress_native_solver_output(enabled=suppress_solver_output):
+            solution = solve_rpml(
+                scenario_instance,
+                time_limit_seconds=time_limit_seconds,
+                solver_name=solver_name,
+                ru_mode=ru_mode,
+            )
         scenario_rows.append(
             {
                 "instance_name": instance.name,
@@ -760,6 +789,7 @@ def process_monte_carlo_instance(args_tuple):
             checkpoint_path=checkpoint_path,
             existing_scenario_results=existing_scenario_results,
             ru_mode=ru_mode,
+            suppress_solver_output=True,
         )
         return ("ok", aggregate, scenario_rows, scenario_comparisons)
     except Exception as e:
@@ -1276,12 +1306,13 @@ def process_instance(args_tuple):
 
     try:
         baseline_instance = with_ru_prepayment_rules(instance) if ru_mode else instance
-        optimal_solution = solve_rpml(
-            instance,
-            time_limit_seconds=time_limit_seconds,
-            solver_name=solver_name,
-            ru_mode=ru_mode,
-        )
+        with _suppress_native_solver_output(enabled=True):
+            optimal_solution = solve_rpml(
+                instance,
+                time_limit_seconds=time_limit_seconds,
+                solver_name=solver_name,
+                ru_mode=ru_mode,
+            )
 
         avalanche_solution = debt_avalanche(baseline_instance)
         snowball_solution = debt_snowball(baseline_instance)
