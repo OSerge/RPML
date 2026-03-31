@@ -10,7 +10,7 @@ from typing import Optional
 import numpy as np
 from ortools.linear_solver import pywraplp
 
-from .data_loader import PROHIBITED_VALUE, RiosSolisInstance
+from .data_loader import PROHIBITED_VALUE, RiosSolisInstance, with_ru_prepayment_rules
 
 
 @dataclass
@@ -51,6 +51,7 @@ class RPMLModel:
         instance: RiosSolisInstance,
         time_limit_seconds: Optional[int] = None,
         solver_name: str = DEFAULT_SOLVER,
+        ru_mode: bool = False,
     ):
         """
         Initialize RPML model.
@@ -60,7 +61,7 @@ class RPMLModel:
             time_limit_seconds: Maximum solve time (None = no limit)
             solver_name: OR-Tools MIP backend name (e.g. HIGHS, SCIP)
         """
-        self.instance = instance
+        self.instance = with_ru_prepayment_rules(instance) if ru_mode else instance
         self.time_limit = time_limit_seconds
         self.solver_name = solver_name.upper()
         
@@ -405,6 +406,7 @@ def solve_rpml(
     instance: RiosSolisInstance,
     time_limit_seconds: Optional[int] = None,
     solver_name: str = DEFAULT_SOLVER,
+    ru_mode: bool = False,
 ) -> RPMLSolution:
     """
     Convenience function to solve RPML instance.
@@ -417,6 +419,11 @@ def solve_rpml(
     Returns:
         RPMLSolution with results
     """
-    model = RPMLModel(instance, time_limit_seconds, solver_name=solver_name)
+    model = RPMLModel(
+        instance,
+        time_limit_seconds,
+        solver_name=solver_name,
+        ru_mode=ru_mode,
+    )
     return model.solve()
 

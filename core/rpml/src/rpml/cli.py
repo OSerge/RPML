@@ -18,7 +18,7 @@ from typing import List
 import numpy as np
 from tqdm import tqdm
 
-from rpml.data_loader import load_all_instances, get_instances_by_size
+from rpml.data_loader import load_all_instances, get_instances_by_size, with_ru_prepayment_rules
 from rpml.milp_model import DEFAULT_SOLVER, FALLBACK_SOLVER, solve_rpml
 from rpml.baseline import debt_avalanche, debt_snowball
 from rpml.metrics import (
@@ -190,6 +190,7 @@ def run_experiments(
     solver_name: str = DEFAULT_SOLVER,
     export_timelines: bool = False,
     timelines_dir: Path | None = None,
+    ru_mode: bool = False,
 ) -> List[ComparisonResult]:
     """
     Run experiments on all instances.
@@ -255,19 +256,21 @@ def run_experiments(
                 continue
 
             try:
+                baseline_instance = with_ru_prepayment_rules(instance) if ru_mode else instance
                 optimal_solution = solve_rpml(
                     instance,
                     time_limit_seconds=time_limit_seconds,
                     solver_name=solver_name,
+                    ru_mode=ru_mode,
                 )
 
-                avalanche_solution = debt_avalanche(instance)
-                snowball_solution = debt_snowball(instance)
+                avalanche_solution = debt_avalanche(baseline_instance)
+                snowball_solution = debt_snowball(baseline_instance)
                 avalanche_valid, avalanche_errors, avalanche_final_balance = validate_baseline_solution(
-                    avalanche_solution, instance
+                    avalanche_solution, baseline_instance
                 )
                 snowball_valid, snowball_errors, snowball_final_balance = validate_baseline_solution(
-                    snowball_solution, instance
+                    snowball_solution, baseline_instance
                 )
                 avalanche_feasible = avalanche_valid and avalanche_final_balance < 1.0
                 snowball_feasible = snowball_valid and snowball_final_balance < 1.0
@@ -313,7 +316,7 @@ def run_experiments(
                 if export_timelines and timelines_dir is not None:
                     export_timeline_json(
                         output_dir=timelines_dir,
-                        instance=instance,
+                        instance=baseline_instance,
                         comparison=comparison,
                         optimal_solution=optimal_solution,
                         avalanche_solution=avalanche_solution,
@@ -346,6 +349,7 @@ def run_monte_carlo_experiments(
     solver_name: str = DEFAULT_SOLVER,
     checkpoint_path: Path | None = None,
     restart: bool = False,
+    ru_mode: bool = False,
 ) -> tuple[list[MonteCarloAggregateResult], list[dict], list[ComparisonResult]]:
     if verbose:
         print("Loading instances...")
@@ -440,6 +444,7 @@ def run_monte_carlo_experiments(
                     solver_name=solver_name,
                     checkpoint_path=checkpoint_path,
                     existing_scenario_results=existing_results,
+                    ru_mode=ru_mode,
                 )
                 aggregates.append(aggregate)
                 scenario_rows.extend(instance_rows)
@@ -468,6 +473,7 @@ def _run_monte_carlo_for_instance(
     solver_name: str,
     checkpoint_path: Path | str | None = None,
     existing_scenario_results: dict[int, ComparisonResult] | None = None,
+    ru_mode: bool = False,
 ) -> tuple[MonteCarloAggregateResult, list[dict], list[ComparisonResult]]:
     instance_seed = derive_instance_seed(mc_config.seed, instance.name)
     instance_mc_config = dataclasses.replace(mc_config, seed=instance_seed)
@@ -494,10 +500,12 @@ def _run_monte_carlo_for_instance(
             )
             continue
         scenario_instance = replace_instance_income(instance, scenario_income, str(idx))
+        baseline_instance = with_ru_prepayment_rules(scenario_instance) if ru_mode else scenario_instance
         solution = solve_rpml(
             scenario_instance,
             time_limit_seconds=time_limit_seconds,
             solver_name=solver_name,
+            ru_mode=ru_mode,
         )
         scenario_rows.append(
             {
@@ -510,13 +518,13 @@ def _run_monte_carlo_for_instance(
                 "gap": solution.gap,
             }
         )
-        avalanche_solution = debt_avalanche(scenario_instance)
-        snowball_solution = debt_snowball(scenario_instance)
+        avalanche_solution = debt_avalanche(baseline_instance)
+        snowball_solution = debt_snowball(baseline_instance)
         avalanche_valid, _, avalanche_final_balance = validate_baseline_solution(
-            avalanche_solution, scenario_instance
+            avalanche_solution, baseline_instance
         )
         snowball_valid, _, snowball_final_balance = validate_baseline_solution(
-            snowball_solution, scenario_instance
+            snowball_solution, baseline_instance
         )
         avalanche_feasible = avalanche_valid and avalanche_final_balance < 1.0
         snowball_feasible = snowball_valid and snowball_final_balance < 1.0
@@ -556,6 +564,7 @@ def process_monte_carlo_instance(args_tuple):
         solver_name,
         checkpoint_path,
         existing_scenario_results,
+        ru_mode,
     ) = args_tuple
     try:
         aggregate, scenario_rows, scenario_comparisons = _run_monte_carlo_for_instance(
@@ -565,6 +574,7 @@ def process_monte_carlo_instance(args_tuple):
             solver_name=solver_name,
             checkpoint_path=checkpoint_path,
             existing_scenario_results=existing_scenario_results,
+            ru_mode=ru_mode,
         )
         return ("ok", aggregate, scenario_rows, scenario_comparisons)
     except Exception as e:
@@ -714,6 +724,7 @@ def run_monte_carlo_experiments_parallel(
     n_workers: int | None = None,
     checkpoint_path: Path | None = None,
     restart: bool = False,
+    ru_mode: bool = False,
 ) -> tuple[list[MonteCarloAggregateResult], list[dict], list[ComparisonResult]]:
     from multiprocessing import cpu_count
 
@@ -793,6 +804,7 @@ def run_monte_carlo_experiments_parallel(
                 solver_name,
                 str(checkpoint_path) if checkpoint_path is not None else None,
                 existing_results,
+                ru_mode,
             )
         )
 
@@ -940,6 +952,11 @@ def parse_args() -> argparse.Namespace:
         help="Use SCIP directly for all instances and disable HiGHS->SCIP fallback",
     )
     parser.add_argument(
+        "--ru",
+        action="store_true",
+        help="Apply RU repayment rules: no prepayment penalties and no prepayment prohibition",
+    )
+    parser.add_argument(
         "--export-timelines",
         action="store_true",
         help="Export per-instance monthly trajectories to JSON files",
@@ -1020,25 +1037,28 @@ def process_instance(args_tuple):
         solver_name,
         export_timelines,
         timelines_dir_str,
+        ru_mode,
     ) = args_tuple
 
     if processed_set is not None and instance.name in processed_set:
         return ("skip_processed", instance.name)
 
     try:
+        baseline_instance = with_ru_prepayment_rules(instance) if ru_mode else instance
         optimal_solution = solve_rpml(
             instance,
             time_limit_seconds=time_limit_seconds,
             solver_name=solver_name,
+            ru_mode=ru_mode,
         )
 
-        avalanche_solution = debt_avalanche(instance)
-        snowball_solution = debt_snowball(instance)
+        avalanche_solution = debt_avalanche(baseline_instance)
+        snowball_solution = debt_snowball(baseline_instance)
         avalanche_valid, _, avalanche_final_balance = validate_baseline_solution(
-            avalanche_solution, instance
+            avalanche_solution, baseline_instance
         )
         snowball_valid, _, snowball_final_balance = validate_baseline_solution(
-            snowball_solution, instance
+            snowball_solution, baseline_instance
         )
         avalanche_feasible = avalanche_valid and avalanche_final_balance < 1.0
         snowball_feasible = snowball_valid and snowball_final_balance < 1.0
@@ -1060,7 +1080,7 @@ def process_instance(args_tuple):
         if export_timelines and timelines_dir_str is not None:
             export_timeline_json(
                 output_dir=Path(timelines_dir_str),
-                instance=instance,
+                instance=baseline_instance,
                 comparison=comparison,
                 optimal_solution=optimal_solution,
                 avalanche_solution=avalanche_solution,
@@ -1094,6 +1114,7 @@ def run_experiments_parallel(
     enable_solver_fallback: bool = True,
     export_timelines: bool = False,
     timelines_dir: Path | None = None,
+    ru_mode: bool = False,
 ) -> List[ComparisonResult]:
     """
     Run experiments on all instances using multiprocessing.
@@ -1164,6 +1185,7 @@ def run_experiments_parallel(
             initial_solver_name,
             export_timelines,
             timelines_dir_str,
+            ru_mode,
         )
         for inst in to_process
     ]
@@ -1254,6 +1276,7 @@ def run_experiments_parallel(
                                         FALLBACK_SOLVER,
                                         export_timelines,
                                         timelines_dir_str,
+                                        ru_mode,
                                     )
                                     pending_args.appendleft(retry_args)
                                     if verbose:
@@ -1340,7 +1363,8 @@ def main():
         print(f"Error: Dataset path not found: {dataset_path}")
         return
 
-    tmp_dir = PROJECT_ROOT / "tmp"
+    base_tmp_dir = PROJECT_ROOT / "tmp"
+    tmp_dir = base_tmp_dir / "ru" if args.ru else base_tmp_dir
     mc_tmp_dir = tmp_dir / "monte_carlo"
     default_checkpoint_path = (
         mc_tmp_dir / "experiment_results_checkpoint.jsonl"
@@ -1391,6 +1415,7 @@ def main():
     print(f"  Watchdog timeout: {args.time_limit + args.watchdog_grace_seconds}s")
     print(f"  Initial solver: {initial_solver_name}")
     print(f"  HiGHS->SCIP fallback: {'enabled' if enable_solver_fallback else 'disabled'}")
+    print(f"  RU mode: {'enabled' if args.ru else 'disabled'}")
     print(f"  Multiprocessing: {'enabled' if args.parallel else 'disabled'}")
     if args.parallel:
         print(f"  Workers: {args.workers or 'auto (CPU count)'}")
@@ -1438,6 +1463,7 @@ def main():
                 n_workers=args.workers,
                 checkpoint_path=checkpoint_path,
                 restart=args.restart,
+                ru_mode=args.ru,
             )
         else:
             aggregates, scenario_rows, scenario_comparisons = run_monte_carlo_experiments(
@@ -1450,6 +1476,7 @@ def main():
                 solver_name=initial_solver_name,
                 checkpoint_path=checkpoint_path,
                 restart=args.restart,
+                ru_mode=args.ru,
             )
         instance_csv, scenario_csv, metadata_json = _write_mc_outputs(
             output_path=mc_output_path,
@@ -1494,6 +1521,7 @@ def main():
             enable_solver_fallback=enable_solver_fallback,
             export_timelines=args.export_timelines,
             timelines_dir=timelines_dir,
+            ru_mode=args.ru,
         )
     else:
         results = run_experiments(
@@ -1509,6 +1537,7 @@ def main():
             solver_name=initial_solver_name,
             export_timelines=args.export_timelines,
             timelines_dir=timelines_dir,
+            ru_mode=args.ru,
         )
 
     print("\n" + "=" * 60)

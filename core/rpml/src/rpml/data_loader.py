@@ -214,3 +214,24 @@ def get_instances_by_size(instances: List[RiosSolisInstance]) -> dict:
         if inst.n in grouped:
             grouped[inst.n].append(inst)
     return grouped
+
+
+def with_ru_prepayment_rules(instance: RiosSolisInstance) -> RiosSolisInstance:
+    return RiosSolisInstance(
+        name=instance.name,
+        n=instance.n,
+        T=instance.T,
+        n_cars=instance.n_cars,
+        n_houses=instance.n_houses,
+        n_credit_cards=instance.n_credit_cards,
+        n_bank_loans=instance.n_bank_loans,
+        principals=instance.principals.copy(),
+        interest_rates=instance.interest_rates.copy(),
+        default_rates=instance.default_rates.copy(),
+        min_payment_pct=instance.min_payment_pct.copy(),
+        prepay_penalty=np.zeros_like(instance.prepay_penalty, dtype=float),
+        monthly_income=instance.monthly_income.copy(),
+        release_time=instance.release_time.copy(),
+        stipulated_amount=instance.stipulated_amount.copy(),
+        fixed_payment=instance.fixed_payment.copy(),
+    )
