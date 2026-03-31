@@ -24,7 +24,7 @@ from rpml.baseline import debt_avalanche, debt_snowball
 from rpml.metrics import (
     ComparisonResult,
     MonteCarloAggregateResult,
-    aggregate_monte_carlo_results,
+    aggregate_monte_carlo_results_from_comparisons,
     compare_solutions,
     print_summary,
     validate_baseline_solution,
@@ -179,7 +179,7 @@ def remove_timeout_instances(timeout_log_path: Path | None, instance_names: set[
 
 def run_experiments(
     dataset_path: Path,
-    max_instances_per_group: int = None,
+    max_instances_per_group: int | None = None,
     time_limit_seconds: int = 300,
     verbose: bool = True,
     allowed_n_loans: tuple[int, ...] = (4, 8),
@@ -339,11 +339,13 @@ def run_experiments(
 def run_monte_carlo_experiments(
     dataset_path: Path,
     mc_config: IncomeMCConfig,
-    max_instances_per_group: int = None,
+    max_instances_per_group: int | None = None,
     time_limit_seconds: int = 300,
     verbose: bool = True,
     allowed_n_loans: tuple[int, ...] = (4, 8),
     solver_name: str = DEFAULT_SOLVER,
+    checkpoint_path: Path | None = None,
+    restart: bool = False,
 ) -> tuple[list[MonteCarloAggregateResult], list[dict], list[ComparisonResult]]:
     if verbose:
         print("Loading instances...")
@@ -359,6 +361,40 @@ def run_monte_carlo_experiments(
             if max_instances_per_group:
                 group_instances = group_instances[:max_instances_per_group]
             print(f"  {n_loans} loans (selected): {len(group_instances)} instances")
+
+    checkpoint = (
+        CheckpointManager(checkpoint_path, restart=restart)
+        if checkpoint_path is not None
+        else None
+    )
+    checkpoint_results = checkpoint.load_existing_results() if checkpoint is not None else {}
+    all_instances = []
+    for n_loans in allowed_n_loans:
+        group_instances = grouped.get(n_loans, [])
+        if max_instances_per_group:
+            group_instances = group_instances[:max_instances_per_group]
+        all_instances.extend(group_instances)
+    selected_base_instances = {inst.name for inst in all_instances}
+    existing_by_instance: dict[str, dict[int, ComparisonResult]] = {
+        inst_name: _get_monte_carlo_scenario_results(
+            base_instance_name=inst_name,
+            expected_scenarios=mc_config.n_scenarios,
+            comparison_by_name=checkpoint_results,
+        )
+        for inst_name in selected_base_instances
+    }
+    completed_instances = {
+        inst_name
+        for inst_name in selected_base_instances
+        if len(existing_by_instance.get(inst_name, {})) == mc_config.n_scenarios
+    }
+    if verbose and checkpoint_path is not None:
+        if completed_instances:
+            print(
+                f"Resuming Monte Carlo: {len(completed_instances)} base instance(s) fully completed in checkpoint"
+            )
+        else:
+            print("Monte Carlo checkpoint has no fully completed base instances")
 
     aggregates: list[MonteCarloAggregateResult] = []
     scenario_rows: list[dict] = []
@@ -379,12 +415,31 @@ def run_monte_carlo_experiments(
         iterator = tqdm(group_instances, file=sys.stdout) if verbose else group_instances
 
         for instance in iterator:
+            if instance.name in completed_instances:
+                if verbose:
+                    tqdm.write(
+                        f"Skipping {instance.name} (Monte Carlo fully completed in checkpoint)",
+                        file=sys.stdout,
+                    )
+                continue
             try:
+                existing_results = existing_by_instance.get(instance.name, {})
+                if verbose and existing_results:
+                    tqdm.write(
+                        _format_monte_carlo_resume_line(
+                            base_instance_name=instance.name,
+                            done_scenarios=len(existing_results),
+                            total_scenarios=mc_config.n_scenarios,
+                        ),
+                        file=sys.stdout,
+                    )
                 aggregate, instance_rows, instance_comparisons = _run_monte_carlo_for_instance(
                     instance=instance,
                     mc_config=mc_config,
                     time_limit_seconds=time_limit_seconds,
                     solver_name=solver_name,
+                    checkpoint_path=checkpoint_path,
+                    existing_scenario_results=existing_results,
                 )
                 aggregates.append(aggregate)
                 scenario_rows.extend(instance_rows)
@@ -394,6 +449,13 @@ def run_monte_carlo_experiments(
                     print(f"\nError processing {instance.name}: {e}")
                 continue
 
+    if checkpoint is not None:
+        checkpoint_results = checkpoint.load_existing_results()
+        return _build_monte_carlo_outputs_from_checkpoint(
+            comparison_by_name=checkpoint_results,
+            expected_scenarios=mc_config.n_scenarios,
+            selected_base_instances=selected_base_instances,
+        )
     _sort_monte_carlo_outputs(aggregates, scenario_rows, scenario_comparisons)
     return aggregates, scenario_rows, scenario_comparisons
 
@@ -404,22 +466,39 @@ def _run_monte_carlo_for_instance(
     mc_config: IncomeMCConfig,
     time_limit_seconds: int,
     solver_name: str,
+    checkpoint_path: Path | str | None = None,
+    existing_scenario_results: dict[int, ComparisonResult] | None = None,
 ) -> tuple[MonteCarloAggregateResult, list[dict], list[ComparisonResult]]:
     instance_seed = derive_instance_seed(mc_config.seed, instance.name)
     instance_mc_config = dataclasses.replace(mc_config, seed=instance_seed)
     incomes = simulate_income_paths(instance.monthly_income, instance_mc_config)
 
-    scenario_solutions = []
+    existing_scenario_results = existing_scenario_results or {}
     scenario_rows: list[dict] = []
     scenario_comparisons: list[ComparisonResult] = []
+    checkpoint = CheckpointManager(Path(checkpoint_path)) if checkpoint_path is not None else None
     for idx, scenario_income in enumerate(incomes):
+        existing = existing_scenario_results.get(idx)
+        if existing is not None:
+            scenario_comparisons.append(existing)
+            scenario_rows.append(
+                {
+                    "instance_name": instance.name,
+                    "scenario_name": existing.instance_name,
+                    "scenario_index": idx,
+                    "status": existing.optimal_status,
+                    "objective_cost": existing.optimal_cost,
+                    "solve_time": existing.optimal_solve_time,
+                    "gap": existing.optimal_gap,
+                }
+            )
+            continue
         scenario_instance = replace_instance_income(instance, scenario_income, str(idx))
         solution = solve_rpml(
             scenario_instance,
             time_limit_seconds=time_limit_seconds,
             solver_name=solver_name,
         )
-        scenario_solutions.append(solution)
         scenario_rows.append(
             {
                 "instance_name": instance.name,
@@ -441,8 +520,7 @@ def _run_monte_carlo_for_instance(
         )
         avalanche_feasible = avalanche_valid and avalanche_final_balance < 1.0
         snowball_feasible = snowball_valid and snowball_final_balance < 1.0
-        scenario_comparisons.append(
-            compare_solutions(
+        comparison = compare_solutions(
                 optimal=solution,
                 avalanche=avalanche_solution,
                 snowball=snowball_solution,
@@ -455,12 +533,14 @@ def _run_monte_carlo_for_instance(
                 snowball_repaid_by_T=snowball_feasible,
                 snowball_final_balance=snowball_final_balance,
             )
-        )
+        scenario_comparisons.append(comparison)
+        if checkpoint is not None:
+            checkpoint.save_result(comparison)
 
-    aggregate = aggregate_monte_carlo_results(
+    aggregate = aggregate_monte_carlo_results_from_comparisons(
         instance_name=instance.name,
         n_loans=instance.n,
-        scenario_solutions=scenario_solutions,
+        scenario_results=scenario_comparisons,
     )
     return aggregate, scenario_rows, scenario_comparisons
 
@@ -469,13 +549,22 @@ def process_monte_carlo_instance(args_tuple):
     """
     Process one base instance in Monte Carlo mode (for multiprocessing).
     """
-    instance, mc_config, time_limit_seconds, solver_name = args_tuple
+    (
+        instance,
+        mc_config,
+        time_limit_seconds,
+        solver_name,
+        checkpoint_path,
+        existing_scenario_results,
+    ) = args_tuple
     try:
         aggregate, scenario_rows, scenario_comparisons = _run_monte_carlo_for_instance(
             instance=instance,
             mc_config=mc_config,
             time_limit_seconds=time_limit_seconds,
             solver_name=solver_name,
+            checkpoint_path=checkpoint_path,
+            existing_scenario_results=existing_scenario_results,
         )
         return ("ok", aggregate, scenario_rows, scenario_comparisons)
     except Exception as e:
@@ -506,15 +595,125 @@ def _sort_monte_carlo_outputs(
     scenario_comparisons.sort(key=lambda item: _scenario_name_sort_key(item.instance_name))
 
 
+def _split_monte_carlo_scenario_name(name: str) -> tuple[str, int] | None:
+    if "__mc_" not in name:
+        return None
+    base, suffix = name.rsplit("__mc_", 1)
+    if not suffix.isdigit():
+        return None
+    return base, int(suffix)
+
+
+def _is_monte_carlo_instance_complete(
+    base_instance_name: str,
+    expected_scenarios: int,
+    comparison_by_name: dict[str, ComparisonResult],
+) -> bool:
+    return len(
+        _get_monte_carlo_scenario_results(
+            base_instance_name=base_instance_name,
+            expected_scenarios=expected_scenarios,
+            comparison_by_name=comparison_by_name,
+        )
+    ) == expected_scenarios
+
+
+def _get_monte_carlo_scenario_results(
+    *,
+    base_instance_name: str,
+    expected_scenarios: int,
+    comparison_by_name: dict[str, ComparisonResult],
+) -> dict[int, ComparisonResult]:
+    out: dict[int, ComparisonResult] = {}
+    for idx in range(expected_scenarios):
+        scenario_name = f"{base_instance_name}__mc_{idx}"
+        result = comparison_by_name.get(scenario_name)
+        if result is not None:
+            out[idx] = result
+    return out
+
+
+def _build_monte_carlo_outputs_from_checkpoint(
+    comparison_by_name: dict[str, ComparisonResult],
+    expected_scenarios: int,
+    selected_base_instances: set[str],
+) -> tuple[list[MonteCarloAggregateResult], list[dict], list[ComparisonResult]]:
+    grouped: dict[str, list[ComparisonResult]] = {}
+    for result in comparison_by_name.values():
+        parsed = _split_monte_carlo_scenario_name(result.instance_name)
+        if parsed is None:
+            continue
+        base_name, _ = parsed
+        if base_name not in selected_base_instances:
+            continue
+        grouped.setdefault(base_name, []).append(result)
+
+    aggregates: list[MonteCarloAggregateResult] = []
+    scenario_rows: list[dict] = []
+    scenario_comparisons: list[ComparisonResult] = []
+
+    for base_name, results in grouped.items():
+        by_idx: dict[int, ComparisonResult] = {}
+        for result in results:
+            parsed = _split_monte_carlo_scenario_name(result.instance_name)
+            if parsed is None:
+                continue
+            _, idx = parsed
+            by_idx[idx] = result
+        if len(by_idx) < expected_scenarios:
+            continue
+        ordered = [by_idx[idx] for idx in range(expected_scenarios) if idx in by_idx]
+        if len(ordered) != expected_scenarios:
+            continue
+
+        aggregates.append(
+            aggregate_monte_carlo_results_from_comparisons(
+                instance_name=base_name,
+                n_loans=ordered[0].n_loans,
+                scenario_results=ordered,
+            )
+        )
+        scenario_comparisons.extend(ordered)
+        for idx, result in enumerate(ordered):
+            scenario_rows.append(
+                {
+                    "instance_name": base_name,
+                    "scenario_name": result.instance_name,
+                    "scenario_index": idx,
+                    "status": result.optimal_status,
+                    "objective_cost": result.optimal_cost,
+                    "solve_time": result.optimal_solve_time,
+                    "gap": result.optimal_gap,
+                }
+            )
+
+    _sort_monte_carlo_outputs(aggregates, scenario_rows, scenario_comparisons)
+    return aggregates, scenario_rows, scenario_comparisons
+
+
+def _format_monte_carlo_resume_line(
+    base_instance_name: str,
+    done_scenarios: int,
+    total_scenarios: int,
+) -> str:
+    remaining = max(total_scenarios - done_scenarios, 0)
+    return (
+        f"{base_instance_name}: resumed {done_scenarios}/{total_scenarios}, "
+        f"remaining {remaining}"
+    )
+
+
 def run_monte_carlo_experiments_parallel(
     dataset_path: Path,
     mc_config: IncomeMCConfig,
-    max_instances_per_group: int = None,
+    max_instances_per_group: int | None = None,
     time_limit_seconds: int = 300,
     verbose: bool = True,
     allowed_n_loans: tuple[int, ...] = (4, 8),
     solver_name: str = DEFAULT_SOLVER,
     n_workers: int | None = None,
+    checkpoint_path: Path | None = None,
+    restart: bool = False,
 ) -> tuple[list[MonteCarloAggregateResult], list[dict], list[ComparisonResult]]:
     from multiprocessing import cpu_count
 
@@ -542,13 +741,60 @@ def run_monte_carlo_experiments_parallel(
             group_instances = group_instances[:max_instances_per_group]
         all_instances.extend(group_instances)
 
-    if verbose:
-        print(f"\nProcessing {len(all_instances)} instances in parallel with Monte Carlo...")
-
-    args_list = [
-        (instance, mc_config, time_limit_seconds, solver_name)
-        for instance in all_instances
+    checkpoint = (
+        CheckpointManager(checkpoint_path, restart=restart)
+        if checkpoint_path is not None
+        else None
+    )
+    checkpoint_results = checkpoint.load_existing_results() if checkpoint is not None else {}
+    selected_base_instances = {inst.name for inst in all_instances}
+    existing_by_instance: dict[str, dict[int, ComparisonResult]] = {
+        inst_name: _get_monte_carlo_scenario_results(
+            base_instance_name=inst_name,
+            expected_scenarios=mc_config.n_scenarios,
+            comparison_by_name=checkpoint_results,
+        )
+        for inst_name in selected_base_instances
+    }
+    completed_instances = {
+        inst_name
+        for inst_name in selected_base_instances
+        if len(existing_by_instance.get(inst_name, {})) == mc_config.n_scenarios
+    }
+    instances_to_process = [
+        inst for inst in all_instances if inst.name not in completed_instances
     ]
+
+    if verbose:
+        print(
+            f"\nProcessing {len(instances_to_process)} instances in parallel with Monte Carlo..."
+        )
+        if completed_instances:
+            print(
+                f"  (Skipped {len(completed_instances)} base instance(s) fully completed in checkpoint)"
+            )
+
+    args_list = []
+    for instance in instances_to_process:
+        existing_results = existing_by_instance.get(instance.name, {})
+        if verbose and existing_results:
+            print(
+                _format_monte_carlo_resume_line(
+                    base_instance_name=instance.name,
+                    done_scenarios=len(existing_results),
+                    total_scenarios=mc_config.n_scenarios,
+                )
+            )
+        args_list.append(
+            (
+                instance,
+                mc_config,
+                time_limit_seconds,
+                solver_name,
+                str(checkpoint_path) if checkpoint_path is not None else None,
+                existing_results,
+            )
+        )
 
     worker_count = n_workers or cpu_count()
     if verbose:
@@ -593,6 +839,13 @@ def run_monte_carlo_experiments_parallel(
             _kill_executor_workers(executor)
         raise
 
+    if checkpoint is not None:
+        checkpoint_results = checkpoint.load_existing_results()
+        return _build_monte_carlo_outputs_from_checkpoint(
+            comparison_by_name=checkpoint_results,
+            expected_scenarios=mc_config.n_scenarios,
+            selected_base_instances=selected_base_instances,
+        )
     _sort_monte_carlo_outputs(aggregates, scenario_rows, scenario_comparisons)
     return aggregates, scenario_rows, scenario_comparisons
 
@@ -827,12 +1080,12 @@ def process_instance(args_tuple):
 
 def run_experiments_parallel(
     dataset_path: Path,
-    max_instances_per_group: int = None,
+    max_instances_per_group: int | None = None,
     time_limit_seconds: int = 300,
     watchdog_grace_seconds: int = 15,
     verbose: bool = True,
     allowed_n_loans: tuple[int, ...] = (4, 8),
-    n_workers: int = None,
+    n_workers: int | None = None,
     checkpoint_path: Path | None = None,
     timeout_log_path: Path | None = None,
     skip_known_timeouts: bool = True,
@@ -1088,8 +1341,19 @@ def main():
         return
 
     tmp_dir = PROJECT_ROOT / "tmp"
-    checkpoint_path = args.checkpoint or (tmp_dir / "experiment_results_checkpoint.jsonl")
-    timeout_log_path = args.timeout_log or (tmp_dir / "timeout_instances.csv")
+    mc_tmp_dir = tmp_dir / "monte_carlo"
+    default_checkpoint_path = (
+        mc_tmp_dir / "experiment_results_checkpoint.jsonl"
+        if args.mc_income
+        else tmp_dir / "experiment_results_checkpoint.jsonl"
+    )
+    default_timeout_log_path = (
+        mc_tmp_dir / "timeout_instances.csv"
+        if args.mc_income
+        else tmp_dir / "timeout_instances.csv"
+    )
+    checkpoint_path = args.checkpoint or default_checkpoint_path
+    timeout_log_path = args.timeout_log or default_timeout_log_path
     timelines_dir = args.timelines_dir or (tmp_dir / "timelines")
     initial_solver_name, enable_solver_fallback = resolve_solver_strategy(args.scip)
 
@@ -1149,7 +1413,7 @@ def main():
     print()
 
     if args.mc_income:
-        mc_output_path = args.mc_output or (tmp_dir / "mc_income_results.csv")
+        mc_output_path = args.mc_output or (mc_tmp_dir / "mc_income_results.csv")
         mc_config = IncomeMCConfig(
             n_scenarios=args.mc_scenarios,
             seed=args.mc_seed,
@@ -1172,6 +1436,8 @@ def main():
                 allowed_n_loans=tuple(args.n_loans),
                 solver_name=initial_solver_name,
                 n_workers=args.workers,
+                checkpoint_path=checkpoint_path,
+                restart=args.restart,
             )
         else:
             aggregates, scenario_rows, scenario_comparisons = run_monte_carlo_experiments(
@@ -1182,6 +1448,8 @@ def main():
                 verbose=True,
                 allowed_n_loans=tuple(args.n_loans),
                 solver_name=initial_solver_name,
+                checkpoint_path=checkpoint_path,
+                restart=args.restart,
             )
         instance_csv, scenario_csv, metadata_json = _write_mc_outputs(
             output_path=mc_output_path,

@@ -108,6 +108,51 @@ def aggregate_monte_carlo_results(
     )
 
 
+def aggregate_monte_carlo_results_from_comparisons(
+    instance_name: str,
+    n_loans: int,
+    scenario_results: list[ComparisonResult],
+) -> MonteCarloAggregateResult:
+    """Aggregate Monte Carlo metrics from per-scenario comparison results."""
+    if not scenario_results:
+        raise ValueError("scenario_results must not be empty")
+
+    scenario_count = len(scenario_results)
+    feasible = [s for s in scenario_results if s.optimal_status in ("OPTIMAL", "FEASIBLE")]
+    feasible_count = len(feasible)
+    infeasible_count = scenario_count - feasible_count
+    infeasible_rate = float(infeasible_count / scenario_count)
+
+    if feasible_count > 0:
+        costs = np.array([s.optimal_cost for s in feasible], dtype=float)
+        mean_cost = float(np.mean(costs))
+        median_cost = float(np.median(costs))
+        p90_cost = float(np.percentile(costs, 90))
+    else:
+        mean_cost = float("inf")
+        median_cost = float("inf")
+        p90_cost = float("inf")
+
+    solve_times = np.array([s.optimal_solve_time for s in scenario_results], dtype=float)
+    mean_solve_time = float(np.mean(solve_times))
+    p90_solve_time = float(np.percentile(solve_times, 90))
+
+    return MonteCarloAggregateResult(
+        instance_name=instance_name,
+        n_loans=n_loans,
+        n_scenarios=scenario_count,
+        feasible_scenarios=feasible_count,
+        infeasible_scenarios=infeasible_count,
+        infeasible_rate=infeasible_rate,
+        mean_cost=mean_cost,
+        median_cost=median_cost,
+        p90_cost=p90_cost,
+        mean_solve_time=mean_solve_time,
+        p90_solve_time=p90_solve_time,
+        p95_required_budget_overrun_proxy=infeasible_rate,
+    )
+
+
 def validate_baseline_solution(solution: BaselineSolution, instance) -> tuple[bool, list[str], float]:
     """
     Validate a baseline payment schedule independently of whether it fully repays

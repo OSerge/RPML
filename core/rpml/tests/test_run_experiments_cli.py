@@ -14,6 +14,7 @@ from rpml.cli import (
     run_monte_carlo_experiments,
     run_monte_carlo_experiments_parallel,
 )
+from rpml.checkpoint import CheckpointManager
 from rpml.income_monte_carlo import IncomeMCConfig
 from rpml.metrics import ComparisonResult, MonteCarloAggregateResult
 from rpml.milp_model import DEFAULT_SOLVER, FALLBACK_SOLVER
@@ -146,7 +147,7 @@ def test_run_monte_carlo_experiments_returns_scenario_comparisons(monkeypatch):
         ),
     )
     monkeypatch.setattr(
-        "rpml.cli.aggregate_monte_carlo_results",
+        "rpml.cli.aggregate_monte_carlo_results_from_comparisons",
         lambda **kwargs: MonteCarloAggregateResult(
             instance_name=kwargs["instance_name"],
             n_loans=kwargs["n_loans"],
@@ -370,6 +371,62 @@ def test_main_mc_income_parallel_uses_parallel_runner(monkeypatch, capsys, tmp_p
     assert "MONTE CARLO INCOME SUMMARY" in out
 
 
+def test_main_mc_income_uses_separate_default_directory(monkeypatch, tmp_path):
+    dataset_path = tmp_path / "RiosSolisDataset" / "Instances" / "Instances"
+    dataset_path.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr("rpml.cli.PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(
+        "rpml.cli.parse_args",
+        lambda: Namespace(
+            checkpoint=None,
+            timeout_log=None,
+            timelines_dir=None,
+            scip=False,
+            summary=False,
+            max_instances=None,
+            n_loans=[4],
+            time_limit=1,
+            watchdog_grace_seconds=1,
+            parallel=False,
+            workers=None,
+            export_timelines=False,
+            mc_income=True,
+            mc_scenarios=2,
+            mc_seed=42,
+            mc_rho=0.55,
+            mc_sigma=0.15,
+            mc_shock_prob=0.04,
+            mc_shock_severity=0.30,
+            mc_output=None,
+            include_known_timeouts=False,
+            restart=False,
+        ),
+    )
+
+    captured = {"checkpoint_path": None, "output_path": None}
+
+    def _runner(**kwargs):
+        captured["checkpoint_path"] = kwargs.get("checkpoint_path")
+        return ([], [], [])
+
+    def _writer(**kwargs):
+        captured["output_path"] = kwargs.get("output_path")
+        output_path = kwargs["output_path"]
+        return (
+            output_path,
+            output_path.with_name(f"{output_path.stem}_scenarios{output_path.suffix}"),
+            output_path.with_name(f"{output_path.stem}_meta.json"),
+        )
+
+    monkeypatch.setattr("rpml.cli.run_monte_carlo_experiments", _runner)
+    monkeypatch.setattr("rpml.cli._write_mc_outputs", _writer)
+
+    main()
+
+    assert captured["checkpoint_path"] == tmp_path / "tmp" / "monte_carlo" / "experiment_results_checkpoint.jsonl"
+    assert captured["output_path"] == tmp_path / "tmp" / "monte_carlo" / "mc_income_results.csv"
+
+
 def test_process_monte_carlo_instance_returns_instance_payload(monkeypatch):
     instance = SimpleNamespace(name="inst_a", n=4, monthly_income=np.array([100.0, 100.0]))
     monkeypatch.setattr("rpml.cli.derive_instance_seed", lambda base_seed, instance_name: 11)
@@ -418,7 +475,7 @@ def test_process_monte_carlo_instance_returns_instance_payload(monkeypatch):
         ),
     )
     monkeypatch.setattr(
-        "rpml.cli.aggregate_monte_carlo_results",
+        "rpml.cli.aggregate_monte_carlo_results_from_comparisons",
         lambda **kwargs: MonteCarloAggregateResult(
             instance_name=kwargs["instance_name"],
             n_loans=kwargs["n_loans"],
@@ -436,7 +493,14 @@ def test_process_monte_carlo_instance_returns_instance_payload(monkeypatch):
     )
 
     result = process_monte_carlo_instance(
-        (instance, IncomeMCConfig(n_scenarios=2, seed=1), 1, DEFAULT_SOLVER)
+        (
+            instance,
+            IncomeMCConfig(n_scenarios=2, seed=1),
+            1,
+            DEFAULT_SOLVER,
+            None,
+            {},
+        )
     )
 
     assert result[0] == "ok"
@@ -614,3 +678,227 @@ def test_run_monte_carlo_experiments_parallel_keyboard_interrupt_kills_workers(m
 
     assert killed["flag"] is True
     assert shutdown_called["flag"] is True
+
+
+def _mc_comparison(name: str, n_loans: int = 4, status: str = "OPTIMAL") -> ComparisonResult:
+    return ComparisonResult(
+        instance_name=name,
+        n_loans=n_loans,
+        optimal_cost=950.0,
+        optimal_solve_time=0.2,
+        optimal_gap=0.0,
+        optimal_status=status,
+        avalanche_cost=1000.0,
+        avalanche_valid=True,
+        avalanche_feasible=True,
+        avalanche_final_balance=0.0,
+        avalanche_horizon_spend_advantage=5.0,
+        avalanche_savings=5.0,
+        snowball_cost=1100.0,
+        snowball_valid=True,
+        snowball_feasible=True,
+        snowball_final_balance=0.0,
+        snowball_horizon_spend_advantage=13.64,
+        snowball_savings=13.64,
+    )
+
+
+def test_run_monte_carlo_experiments_skips_only_fully_completed_instances(monkeypatch, tmp_path):
+    instance = SimpleNamespace(name="inst_a", n=4, monthly_income=np.array([100.0, 100.0]))
+    monkeypatch.setattr("rpml.cli.load_all_instances", lambda _: [instance])
+    monkeypatch.setattr("rpml.cli.get_instances_by_size", lambda _: {4: [instance]})
+    monkeypatch.setattr(
+        "rpml.cli._run_monte_carlo_for_instance",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("instance should be skipped")),
+    )
+
+    checkpoint_path = tmp_path / "mc_checkpoint.jsonl"
+    mgr = CheckpointManager(checkpoint_path)
+    mgr.save_result(_mc_comparison("inst_a__mc_0"))
+    mgr.save_result(_mc_comparison("inst_a__mc_1"))
+
+    aggregates, scenario_rows, scenario_comparisons = run_monte_carlo_experiments(
+        dataset_path=Path("/tmp/unused"),
+        mc_config=IncomeMCConfig(n_scenarios=2, seed=1),
+        max_instances_per_group=1,
+        verbose=False,
+        allowed_n_loans=(4,),
+        checkpoint_path=checkpoint_path,
+    )
+
+    assert len(aggregates) == 1
+    assert aggregates[0].instance_name == "inst_a"
+    assert len(scenario_rows) == 2
+    assert [r.instance_name for r in scenario_comparisons] == ["inst_a__mc_0", "inst_a__mc_1"]
+
+
+def test_run_monte_carlo_experiments_resumes_incomplete_instance_by_missing_scenarios(monkeypatch, tmp_path):
+    instance = SimpleNamespace(name="inst_a", n=4, monthly_income=np.array([100.0, 100.0]))
+    monkeypatch.setattr("rpml.cli.load_all_instances", lambda _: [instance])
+    monkeypatch.setattr("rpml.cli.get_instances_by_size", lambda _: {4: [instance]})
+
+    checkpoint_path = tmp_path / "mc_checkpoint.jsonl"
+    mgr = CheckpointManager(checkpoint_path)
+    mgr.save_result(_mc_comparison("inst_a__mc_0"))
+
+    captured_existing = {"count": 0}
+
+    def _fake_run_instance(**kwargs):
+        captured_existing["count"] = len(kwargs["existing_scenario_results"])
+        ck = CheckpointManager(Path(kwargs["checkpoint_path"]))
+        c0 = kwargs["existing_scenario_results"][0]
+        c1 = _mc_comparison("inst_a__mc_1")
+        ck.save_result(c1)
+        aggregate = MonteCarloAggregateResult(
+            instance_name="inst_a",
+            n_loans=4,
+            n_scenarios=2,
+            feasible_scenarios=2,
+            infeasible_scenarios=0,
+            infeasible_rate=0.0,
+            mean_cost=950.0,
+            median_cost=950.0,
+            p90_cost=950.0,
+            mean_solve_time=0.2,
+            p90_solve_time=0.2,
+            p95_required_budget_overrun_proxy=0.0,
+        )
+        rows = [
+            {"instance_name": "inst_a", "scenario_name": "inst_a__mc_0", "scenario_index": 0},
+            {"instance_name": "inst_a", "scenario_name": "inst_a__mc_1", "scenario_index": 1},
+        ]
+        return aggregate, rows, [c0, c1]
+
+    monkeypatch.setattr("rpml.cli._run_monte_carlo_for_instance", _fake_run_instance)
+
+    aggregates, scenario_rows, scenario_comparisons = run_monte_carlo_experiments(
+        dataset_path=Path("/tmp/unused"),
+        mc_config=IncomeMCConfig(n_scenarios=2, seed=1),
+        max_instances_per_group=1,
+        verbose=False,
+        allowed_n_loans=(4,),
+        checkpoint_path=checkpoint_path,
+    )
+
+    assert captured_existing["count"] == 1
+    assert len(aggregates) == 1
+    assert len(scenario_rows) == 2
+    assert [r.instance_name for r in scenario_comparisons] == ["inst_a__mc_0", "inst_a__mc_1"]
+
+
+def test_run_monte_carlo_parallel_skips_fully_completed_instances(monkeypatch, tmp_path):
+    instance = SimpleNamespace(name="inst_a", n=4, monthly_income=np.array([100.0, 100.0]))
+    monkeypatch.setattr("rpml.cli.load_all_instances", lambda _: [instance])
+    monkeypatch.setattr("rpml.cli.get_instances_by_size", lambda _: {4: [instance]})
+
+    checkpoint_path = tmp_path / "mc_checkpoint.jsonl"
+    mgr = CheckpointManager(checkpoint_path)
+    mgr.save_result(_mc_comparison("inst_a__mc_0"))
+    mgr.save_result(_mc_comparison("inst_a__mc_1"))
+
+    submit_calls = {"count": 0}
+
+    class _FakeExecutor:
+        def __init__(self, max_workers=None):
+            self.max_workers = max_workers
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def submit(self, fn, args):
+            submit_calls["count"] += 1
+            return None
+
+    monkeypatch.setattr("rpml.cli.futures.ProcessPoolExecutor", _FakeExecutor)
+    monkeypatch.setattr("rpml.cli.futures.as_completed", lambda submitted: [])
+
+    aggregates, scenario_rows, scenario_comparisons = run_monte_carlo_experiments_parallel(
+        dataset_path=Path("/tmp/unused"),
+        mc_config=IncomeMCConfig(n_scenarios=2, seed=1),
+        max_instances_per_group=1,
+        verbose=False,
+        allowed_n_loans=(4,),
+        n_workers=1,
+        checkpoint_path=checkpoint_path,
+    )
+
+    assert submit_calls["count"] == 0
+    assert len(aggregates) == 1
+    assert len(scenario_rows) == 2
+    assert [r.instance_name for r in scenario_comparisons] == ["inst_a__mc_0", "inst_a__mc_1"]
+
+
+def test_run_monte_carlo_parallel_resumes_only_missing_scenarios(monkeypatch, tmp_path):
+    instance = SimpleNamespace(name="inst_a", n=4, monthly_income=np.array([100.0, 100.0]))
+    monkeypatch.setattr("rpml.cli.load_all_instances", lambda _: [instance])
+    monkeypatch.setattr("rpml.cli.get_instances_by_size", lambda _: {4: [instance]})
+
+    checkpoint_path = tmp_path / "mc_checkpoint.jsonl"
+    mgr = CheckpointManager(checkpoint_path)
+    mgr.save_result(_mc_comparison("inst_a__mc_0"))
+
+    submit_payload = {"existing_count": None}
+
+    class _FakeFuture:
+        def __init__(self, value):
+            self._value = value
+
+        def result(self):
+            return self._value
+
+    class _FakeExecutor:
+        def __init__(self, max_workers=None):
+            self.max_workers = max_workers
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def submit(self, fn, args):
+            submit_payload["existing_count"] = len(args[5])
+            ck = CheckpointManager(Path(args[4]))
+            ck.save_result(_mc_comparison("inst_a__mc_1"))
+            return _FakeFuture(
+                (
+                    "ok",
+                    MonteCarloAggregateResult(
+                        instance_name="inst_a",
+                        n_loans=4,
+                        n_scenarios=2,
+                        feasible_scenarios=2,
+                        infeasible_scenarios=0,
+                        infeasible_rate=0.0,
+                        mean_cost=950.0,
+                        median_cost=950.0,
+                        p90_cost=950.0,
+                        mean_solve_time=0.2,
+                        p90_solve_time=0.2,
+                        p95_required_budget_overrun_proxy=0.0,
+                    ),
+                    [],
+                    [],
+                )
+            )
+
+    monkeypatch.setattr("rpml.cli.futures.ProcessPoolExecutor", _FakeExecutor)
+    monkeypatch.setattr("rpml.cli.futures.as_completed", lambda iterable: list(iterable))
+
+    aggregates, scenario_rows, scenario_comparisons = run_monte_carlo_experiments_parallel(
+        dataset_path=Path("/tmp/unused"),
+        mc_config=IncomeMCConfig(n_scenarios=2, seed=1),
+        max_instances_per_group=1,
+        verbose=False,
+        allowed_n_loans=(4,),
+        n_workers=1,
+        checkpoint_path=checkpoint_path,
+    )
+
+    assert submit_payload["existing_count"] == 1
+    assert len(aggregates) == 1
+    assert len(scenario_rows) == 2
+    assert [r.instance_name for r in scenario_comparisons] == ["inst_a__mc_0", "inst_a__mc_1"]
