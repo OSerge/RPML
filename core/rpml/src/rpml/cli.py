@@ -8,12 +8,15 @@ import argparse
 import concurrent.futures as futures
 import csv
 import dataclasses
+import hashlib
 import json
+import re
+import signal
 import sys
 from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List
+from typing import Any, List
 
 import numpy as np
 from tqdm import tqdm
@@ -77,6 +80,185 @@ MC_SCENARIO_CSV_COLUMNS = [
 ]
 
 
+RUN_CONFIG_FILENAME = "run_config.json"
+RUN_STATE_FILENAME = "run_state.json"
+LAST_SHUTDOWN_SIGNAL: int | None = None
+
+
+def _shutdown_signal_handler(signum, _frame) -> None:
+    global LAST_SHUTDOWN_SIGNAL
+    LAST_SHUTDOWN_SIGNAL = signum
+    raise KeyboardInterrupt
+
+
+def _install_shutdown_signal_handlers() -> dict[int, Any]:
+    previous_handlers: dict[int, Any] = {}
+    handled_signals = [signal.SIGINT]
+    if hasattr(signal, "SIGTERM"):
+        handled_signals.append(signal.SIGTERM)
+    for sig in handled_signals:
+        previous_handlers[sig] = signal.getsignal(sig)
+        signal.signal(sig, _shutdown_signal_handler)
+    return previous_handlers
+
+
+def _restore_shutdown_signal_handlers(previous_handlers: dict[int, Any]) -> None:
+    for sig, handler in previous_handlers.items():
+        signal.signal(sig, handler)
+
+
+def _json_ready(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(k): _json_ready(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_ready(v) for v in value]
+    return value
+
+
+def _slugify_token(value: str) -> str:
+    token = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("-")
+    return token or "na"
+
+
+def _build_run_param_slug(args: argparse.Namespace) -> str:
+    loan_counts = "-".join(str(x) for x in sorted(set(args.n_loans)))
+    parts = [
+        "ru" if args.ru else "base",
+        "mc" if args.mc_income else "std",
+        f"n{loan_counts}",
+        f"tl{args.time_limit}",
+    ]
+    if args.max_instances is not None:
+        parts.append(f"m{args.max_instances}")
+    if args.mc_income:
+        parts.extend(
+            [
+                f"sc{args.mc_scenarios}",
+                f"seed{args.mc_seed}",
+            ]
+        )
+    return "_".join(_slugify_token(part) for part in parts)
+
+
+def _build_run_signature(args: argparse.Namespace, initial_solver_name: str) -> dict[str, Any]:
+    signature = {
+        "ru": bool(args.ru),
+        "mc_income": bool(args.mc_income),
+        "n_loans": list(args.n_loans),
+        "max_instances": args.max_instances,
+        "time_limit": args.time_limit,
+        "watchdog_grace_seconds": args.watchdog_grace_seconds,
+        "scip": bool(args.scip),
+        "initial_solver": initial_solver_name,
+        "include_known_timeouts": bool(args.include_known_timeouts),
+        "parallel": bool(args.parallel),
+        "workers": args.workers,
+    }
+    if args.mc_income:
+        signature.update(
+            {
+                "mc_scenarios": args.mc_scenarios,
+                "mc_seed": args.mc_seed,
+                "mc_rho": args.mc_rho,
+                "mc_sigma": args.mc_sigma,
+                "mc_shock_prob": args.mc_shock_prob,
+                "mc_shock_severity": args.mc_shock_severity,
+            }
+        )
+    return signature
+
+
+def _load_json_file(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return None
+    if isinstance(data, dict):
+        return data
+    return None
+
+
+def _write_json_file(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(_json_ready(payload), f, ensure_ascii=False, indent=2)
+
+
+def _write_run_state(run_dir: Path, status: str) -> None:
+    now_iso = datetime.now(timezone.utc).isoformat()
+    state_path = run_dir / RUN_STATE_FILENAME
+    existing = _load_json_file(state_path) or {}
+    payload = {
+        "run_id": run_dir.name,
+        "status": status,
+        "started_at_utc": existing.get("started_at_utc", now_iso),
+        "updated_at_utc": now_iso,
+    }
+    _write_json_file(state_path, payload)
+
+
+def _find_resume_last_run_dir(runs_root: Path) -> Path | None:
+    if not runs_root.exists():
+        return None
+
+    def sort_key(run_dir: Path) -> float:
+        state = _load_json_file(run_dir / RUN_STATE_FILENAME)
+        if state and isinstance(state.get("updated_at_utc"), str):
+            try:
+                return datetime.fromisoformat(state["updated_at_utc"]).timestamp()
+            except ValueError:
+                pass
+        return run_dir.stat().st_mtime
+
+    candidates = []
+    for child in runs_root.iterdir():
+        if not child.is_dir():
+            continue
+        state = _load_json_file(child / RUN_STATE_FILENAME)
+        status = (state or {}).get("status")
+        if status in {"running", "interrupted"}:
+            candidates.append(child)
+            continue
+        checkpoint_dir = child / "checkpoint"
+        if status != "completed" and checkpoint_dir.exists():
+            candidates.append(child)
+    if not candidates:
+        return None
+    candidates.sort(key=sort_key, reverse=True)
+    return candidates[0]
+
+
+def _create_run_id(args: argparse.Namespace, signature: dict[str, Any]) -> str:
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    params_slug = _build_run_param_slug(args)
+    digest = hashlib.sha1(
+        json.dumps(signature, sort_keys=True, ensure_ascii=True).encode("utf-8")
+    ).hexdigest()[:8]
+    return f"{timestamp}_{params_slug}_{digest}"
+
+
+def _resolve_summary_checkpoint_for_run(
+    run_dir: Path,
+    prefer_mc: bool,
+) -> tuple[Path, bool]:
+    std_checkpoint = run_dir / "checkpoint" / "experiment_results_checkpoint.jsonl"
+    mc_checkpoint = run_dir / "checkpoint" / "monte_carlo_experiment_results_checkpoint.jsonl"
+    if prefer_mc:
+        return mc_checkpoint, True
+    if std_checkpoint.exists() and not mc_checkpoint.exists():
+        return std_checkpoint, False
+    if mc_checkpoint.exists() and not std_checkpoint.exists():
+        return mc_checkpoint, True
+    if std_checkpoint.exists() and mc_checkpoint.exists():
+        return std_checkpoint, False
+    return std_checkpoint, False
+
+
 def resolve_solver_strategy(use_scip: bool) -> tuple[str, bool]:
     """Return initial solver and whether HiGHS->SCIP fallback is enabled."""
     if use_scip:
@@ -93,6 +275,7 @@ def _write_mc_outputs(
     aggregates: list[MonteCarloAggregateResult],
     scenario_rows: list[dict],
     config: IncomeMCConfig,
+    run_id: str | None = None,
 ) -> tuple[Path, Path, Path]:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     scenario_path = output_path.with_name(f"{output_path.stem}_scenarios{output_path.suffix}")
@@ -117,6 +300,8 @@ def _write_mc_outputs(
         "instance_count": len(aggregates),
         "scenario_count": len(scenario_rows),
     }
+    if run_id is not None:
+        metadata["run_id"] = run_id
     with open(metadata_path, "w", encoding="utf-8") as f:
         json.dump(metadata, f, ensure_ascii=False, indent=2)
 
@@ -830,26 +1015,35 @@ def run_monte_carlo_experiments_parallel(
             pass
 
     pbar_ctx = tqdm(total=len(args_list), file=sys.stdout) if verbose else nullcontext()
+    submitted = []
     try:
         with pbar_ctx as pbar:
-            with futures.ProcessPoolExecutor(max_workers=worker_count) as executor:
-                submitted = [executor.submit(process_monte_carlo_instance, args) for args in args_list]
-                for future in futures.as_completed(submitted):
-                    result = future.result()
-                    if result and result[0] == "ok":
-                        aggregates.append(result[1])
-                        scenario_rows.extend(result[2])
-                        scenario_comparisons.extend(result[3])
-                    elif result and result[0] == "error" and verbose:
-                        print(f"Error processing {result[1]}: {result[2]}")
-                    if pbar is not None:
-                        pbar.update(1)
+            executor = futures.ProcessPoolExecutor(max_workers=worker_count)
+            submitted = [executor.submit(process_monte_carlo_instance, args) for args in args_list]
+            for future in futures.as_completed(submitted):
+                result = future.result()
+                if result and result[0] == "ok":
+                    aggregates.append(result[1])
+                    scenario_rows.extend(result[2])
+                    scenario_comparisons.extend(result[3])
+                elif result and result[0] == "error" and verbose:
+                    print(f"Error processing {result[1]}: {result[2]}")
+                if pbar is not None:
+                    pbar.update(1)
     except KeyboardInterrupt:
         if verbose:
             print("\nInterrupted by user. Shutting down Monte Carlo workers...")
+        for future in submitted:
+            future.cancel()
         if executor is not None:
             _kill_executor_workers(executor)
         raise
+    finally:
+        if executor is not None:
+            try:
+                executor.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
 
     if checkpoint is not None:
         checkpoint_results = checkpoint.load_existing_results()
@@ -957,6 +1151,35 @@ def parse_args() -> argparse.Namespace:
         help="Apply RU repayment rules: no prepayment penalties and no prepayment prohibition",
     )
     parser.add_argument(
+        "--run",
+        action="store_true",
+        help="Store all artifacts in isolated run directory under tmp/runs/<run_id>",
+    )
+    parser.add_argument(
+        "--run-id",
+        type=str,
+        default=None,
+        metavar="ID",
+        help="Use existing run id (resume) or create run directory with this id",
+    )
+    parser.add_argument(
+        "--resume-last",
+        action="store_true",
+        help="Resume the latest unfinished run from runs directory",
+    )
+    parser.add_argument(
+        "--runs-dir",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Root directory containing run folders (default: tmp/runs)",
+    )
+    parser.add_argument(
+        "--force-params-mismatch",
+        action="store_true",
+        help="Allow run resume even if current parameters differ from saved run config",
+    )
+    parser.add_argument(
         "--export-timelines",
         action="store_true",
         help="Export per-instance monthly trajectories to JSON files",
@@ -1023,7 +1246,15 @@ def parse_args() -> argparse.Namespace:
         help="CSV path for Monte Carlo aggregated results (default: tmp/mc_income_results.csv)",
     )
     
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.run_id and args.resume_last:
+        parser.error("--run-id and --resume-last cannot be used together")
+    run_mode_requested = bool(
+        args.run or args.run_id is not None or args.resume_last or args.runs_dir is not None
+    )
+    if args.force_params_mismatch and not run_mode_requested:
+        parser.error("--force-params-mismatch requires run mode (--run/--run-id/--resume-last)")
+    return args
 
 
 def process_instance(args_tuple):
@@ -1328,11 +1559,9 @@ def run_experiments_parallel(
                 if pending_args:
                     pending_args = deque([a for a in pending_args if a[0].name not in completed_instances])
     except KeyboardInterrupt:
-        import os
-        # Fallback cleanup for stubborn children.
-        os.system("pkill -f 'run-experiments' || true")
-        print("Workers terminated.")
-        sys.exit(1)
+        if verbose:
+            print("\nInterrupted by user. Workers terminated.")
+        raise
 
     for r in raw_results:
         if r is None:
@@ -1355,209 +1584,326 @@ def run_experiments_parallel(
 
 def main():
     """Main entry point."""
-    args = parse_args()
+    global LAST_SHUTDOWN_SIGNAL
+    LAST_SHUTDOWN_SIGNAL = None
+    previous_signal_handlers = _install_shutdown_signal_handlers()
+    run_dir: Path | None = None
+    try:
+        args = parse_args()
 
-    dataset_path = PROJECT_ROOT / "RiosSolisDataset" / "Instances" / "Instances"
+        dataset_path = PROJECT_ROOT / "RiosSolisDataset" / "Instances" / "Instances"
+        if not dataset_path.exists():
+            print(f"Error: Dataset path not found: {dataset_path}")
+            return 1
 
-    if not dataset_path.exists():
-        print(f"Error: Dataset path not found: {dataset_path}")
-        return
-
-    base_tmp_dir = PROJECT_ROOT / "tmp"
-    tmp_dir = base_tmp_dir / "ru" if args.ru else base_tmp_dir
-    mc_tmp_dir = tmp_dir / "monte_carlo"
-    default_checkpoint_path = (
-        mc_tmp_dir / "experiment_results_checkpoint.jsonl"
-        if args.mc_income
-        else tmp_dir / "experiment_results_checkpoint.jsonl"
-    )
-    default_timeout_log_path = (
-        mc_tmp_dir / "timeout_instances.csv"
-        if args.mc_income
-        else tmp_dir / "timeout_instances.csv"
-    )
-    checkpoint_path = args.checkpoint or default_checkpoint_path
-    timeout_log_path = args.timeout_log or default_timeout_log_path
-    timelines_dir = args.timelines_dir or (tmp_dir / "timelines")
-    initial_solver_name, enable_solver_fallback = resolve_solver_strategy(args.scip)
-
-    # Handle --summary mode
-    if args.summary:
-        print("=" * 60)
-        print("RPML EXPERIMENT RESULTS SUMMARY")
-        print("=" * 60)
-        print(f"\nLoading results from: {checkpoint_path}\n")
-        
-        checkpoint = CheckpointManager(checkpoint_path)
-        results = list(checkpoint.load_existing_results().values())
-        
-        if not results:
-            print("No results found in checkpoint.")
-            return
-        
-        print_summary(results)
-        
-        csv_path = tmp_dir / "experiment_results.csv"
-        checkpoint.export_to_csv(csv_path)
-        if results:
-            print(f"\nResults exported to: {csv_path}")
-        return
-
-    print("=" * 60)
-    print("RPML EXPERIMENTS")
-    print("=" * 60)
-    print("\nRunning experiments on Rios-Solis dataset...")
-    print("Comparing optimal MILP with Debt Avalanche and Debt Snowball baselines.")
-    print(f"\nParameters:")
-    print(f"  Max instances per group: {args.max_instances or 'all'}")
-    print(f"  Loan counts: {args.n_loans}")
-    print(f"  Time limit: {args.time_limit}s")
-    print(f"  Watchdog timeout: {args.time_limit + args.watchdog_grace_seconds}s")
-    print(f"  Initial solver: {initial_solver_name}")
-    print(f"  HiGHS->SCIP fallback: {'enabled' if enable_solver_fallback else 'disabled'}")
-    print(f"  RU mode: {'enabled' if args.ru else 'disabled'}")
-    print(f"  Multiprocessing: {'enabled' if args.parallel else 'disabled'}")
-    if args.parallel:
-        print(f"  Workers: {args.workers or 'auto (CPU count)'}")
-    print(f"  Checkpoint: {checkpoint_path}")
-    print(f"  Timeout log: {timeout_log_path}")
-    print(f"  Export timelines: {'yes' if args.export_timelines else 'no'}")
-    if args.export_timelines:
-        print(f"  Timelines dir: {timelines_dir}")
-    print(f"  Monte Carlo income mode: {'yes' if args.mc_income else 'no'}")
-    if args.mc_income:
-        print(f"  MC scenarios: {args.mc_scenarios}")
-        print(f"  MC seed: {args.mc_seed}")
-        print(f"  MC rho: {args.mc_rho}")
-        print(f"  MC sigma: {args.mc_sigma}")
-        print(f"  MC shock prob: {args.mc_shock_prob}")
-        print(f"  MC shock severity: {args.mc_shock_severity}")
-    print(f"  Skip known timeouts: {'no' if args.include_known_timeouts else 'yes'}")
-    if args.restart:
-        print("  Restart: yes (ignoring existing checkpoint)")
-    print()
-
-    if args.mc_income:
-        mc_output_path = args.mc_output or (mc_tmp_dir / "mc_income_results.csv")
-        mc_config = IncomeMCConfig(
-            n_scenarios=args.mc_scenarios,
-            seed=args.mc_seed,
-            rho=args.mc_rho,
-            sigma=args.mc_sigma,
-            shock_prob=args.mc_shock_prob,
-            shock_severity_mean=args.mc_shock_severity,
-            shock_severity_std=max(args.mc_shock_severity * 0.25, 0.01),
-            min_income_floor=1.0,
+        initial_solver_name, enable_solver_fallback = resolve_solver_strategy(args.scip)
+        base_tmp_dir = PROJECT_ROOT / "tmp"
+        run_mode_requested = bool(
+            args.run or args.run_id is not None or args.resume_last or args.runs_dir is not None
         )
-        mc_config.validate()
+        run_id: str | None = None
+        runs_root = args.runs_dir or (base_tmp_dir / "runs")
+        effective_mc_mode = args.mc_income
 
-        if args.parallel:
-            aggregates, scenario_rows, scenario_comparisons = run_monte_carlo_experiments_parallel(
-                dataset_path=dataset_path,
-                mc_config=mc_config,
-                max_instances_per_group=args.max_instances,
-                time_limit_seconds=args.time_limit,
-                verbose=True,
-                allowed_n_loans=tuple(args.n_loans),
-                solver_name=initial_solver_name,
-                n_workers=args.workers,
-                checkpoint_path=checkpoint_path,
-                restart=args.restart,
-                ru_mode=args.ru,
+        if run_mode_requested:
+            runs_root.mkdir(parents=True, exist_ok=True)
+            if args.summary and args.run_id is None and not args.resume_last and args.checkpoint is None:
+                print("Error: --summary with run mode requires --run-id or --resume-last (or explicit --checkpoint).")
+                return 1
+            if args.resume_last:
+                resume_dir = _find_resume_last_run_dir(runs_root)
+                if resume_dir is None:
+                    print(f"Error: no unfinished runs found in {runs_root}")
+                    return 1
+                run_dir = resume_dir
+                run_id = run_dir.name
+            elif args.run_id is not None:
+                run_id = _slugify_token(args.run_id)
+                run_dir = runs_root / run_id
+            else:
+                run_signature = _build_run_signature(args, initial_solver_name)
+                run_id = _create_run_id(args, run_signature)
+                run_dir = runs_root / run_id
+
+            if run_dir is None:
+                print("Error: failed to resolve run directory")
+                return 1
+            if args.summary and args.run_id is not None and not run_dir.exists():
+                print(f"Error: run '{run_id}' not found in {runs_root}")
+                return 1
+            run_dir.mkdir(parents=True, exist_ok=True)
+            if not args.summary:
+                run_signature = _build_run_signature(args, initial_solver_name)
+                run_config_path = run_dir / RUN_CONFIG_FILENAME
+                existing_config = _load_json_file(run_config_path)
+                existing_signature = (existing_config or {}).get("signature")
+                if (
+                    existing_signature is not None
+                    and existing_signature != run_signature
+                    and not args.force_params_mismatch
+                ):
+                    print(f"Error: run '{run_id}' has different parameters in {run_config_path}")
+                    print("Use --force-params-mismatch to continue or start a new run.")
+                    return 1
+
+                config_payload = {
+                    "run_id": run_id,
+                    "created_at_utc": (existing_config or {}).get(
+                        "created_at_utc",
+                        datetime.now(timezone.utc).isoformat(),
+                    ),
+                    "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+                    "signature": run_signature,
+                    "cli_args": vars(args),
+                }
+                _write_json_file(run_config_path, config_payload)
+
+            tmp_dir = run_dir
+            mc_tmp_dir = run_dir / "monte_carlo"
+            if args.summary and args.checkpoint is None:
+                default_checkpoint_path, effective_mc_mode = _resolve_summary_checkpoint_for_run(
+                    run_dir,
+                    args.mc_income,
+                )
+            else:
+                default_checkpoint_path = (
+                    run_dir / "checkpoint" / "monte_carlo_experiment_results_checkpoint.jsonl"
+                    if effective_mc_mode
+                    else run_dir / "checkpoint" / "experiment_results_checkpoint.jsonl"
+                )
+            default_timeout_log_path = (
+                run_dir / "logs" / "monte_carlo_timeout_instances.csv"
+                if effective_mc_mode
+                else run_dir / "logs" / "timeout_instances.csv"
             )
+            default_results_csv_path = (
+                run_dir / "exports" / "monte_carlo_experiment_results.csv"
+                if effective_mc_mode
+                else run_dir / "exports" / "experiment_results.csv"
+            )
+            default_timelines_dir = run_dir / "timelines"
         else:
-            aggregates, scenario_rows, scenario_comparisons = run_monte_carlo_experiments(
-                dataset_path=dataset_path,
-                mc_config=mc_config,
-                max_instances_per_group=args.max_instances,
-                time_limit_seconds=args.time_limit,
-                verbose=True,
-                allowed_n_loans=tuple(args.n_loans),
-                solver_name=initial_solver_name,
-                checkpoint_path=checkpoint_path,
-                restart=args.restart,
-                ru_mode=args.ru,
+            tmp_dir = base_tmp_dir / "ru" if args.ru else base_tmp_dir
+            mc_tmp_dir = tmp_dir / "monte_carlo"
+            default_checkpoint_path = (
+                mc_tmp_dir / "experiment_results_checkpoint.jsonl"
+                if effective_mc_mode
+                else tmp_dir / "experiment_results_checkpoint.jsonl"
             )
-        instance_csv, scenario_csv, metadata_json = _write_mc_outputs(
-            output_path=mc_output_path,
-            aggregates=aggregates,
-            scenario_rows=scenario_rows,
-            config=mc_config,
-        )
+            default_timeout_log_path = (
+                mc_tmp_dir / "timeout_instances.csv"
+                if effective_mc_mode
+                else tmp_dir / "timeout_instances.csv"
+            )
+            default_results_csv_path = (
+                mc_tmp_dir / "experiment_results.csv"
+                if effective_mc_mode
+                else tmp_dir / "experiment_results.csv"
+            )
+            default_timelines_dir = tmp_dir / "timelines"
 
-        print("\n" + "=" * 60)
-        print("MONTE CARLO INCOME SUMMARY")
+        checkpoint_path = args.checkpoint or default_checkpoint_path
+        timeout_log_path = args.timeout_log or default_timeout_log_path
+        timelines_dir = args.timelines_dir or default_timelines_dir
+
+        if args.summary:
+            print("=" * 60)
+            print("RPML EXPERIMENT RESULTS SUMMARY")
+            print("=" * 60)
+            if run_mode_requested:
+                print(f"Run ID: {run_id}")
+                print(f"Run dir: {run_dir}")
+            print(f"\nLoading results from: {checkpoint_path}\n")
+            if not checkpoint_path.exists():
+                print("No checkpoint file found for the selected run/path.")
+                return 0
+
+            checkpoint = CheckpointManager(checkpoint_path)
+            results = list(checkpoint.load_existing_results().values())
+            if not results:
+                print("No results found in checkpoint.")
+                return 0
+            print_summary(results)
+
+            csv_path = default_results_csv_path
+            checkpoint.export_to_csv(csv_path)
+            if results:
+                print(f"\nResults exported to: {csv_path}")
+            return 0
+
         print("=" * 60)
-        print(f"Instances processed: {len(aggregates)}")
-        if aggregates:
-            avg_infeasible = float(np.mean([r.infeasible_rate for r in aggregates]))
-            avg_cost = float(np.mean([r.mean_cost for r in aggregates if np.isfinite(r.mean_cost)]))
-            print(f"Average infeasible rate: {avg_infeasible:.3f}")
-            if np.isfinite(avg_cost):
-                print(f"Average mean cost: {avg_cost:,.2f}")
-        print(f"MC aggregate CSV: {instance_csv}")
-        print(f"MC scenario CSV: {scenario_csv}")
-        print(f"MC metadata JSON: {metadata_json}")
-        if scenario_comparisons:
+        print("RPML EXPERIMENTS")
+        print("=" * 60)
+        print("\nRunning experiments on Rios-Solis dataset...")
+        print("Comparing optimal MILP with Debt Avalanche and Debt Snowball baselines.")
+        print(f"\nParameters:")
+        print(f"  Max instances per group: {args.max_instances or 'all'}")
+        print(f"  Loan counts: {args.n_loans}")
+        print(f"  Time limit: {args.time_limit}s")
+        print(f"  Watchdog timeout: {args.time_limit + args.watchdog_grace_seconds}s")
+        print(f"  Initial solver: {initial_solver_name}")
+        print(f"  HiGHS->SCIP fallback: {'enabled' if enable_solver_fallback else 'disabled'}")
+        print(f"  RU mode: {'enabled' if args.ru else 'disabled'}")
+        print(f"  Run mode: {'enabled' if run_mode_requested else 'disabled'}")
+        if run_mode_requested:
+            print(f"  Runs root: {runs_root}")
+            print(f"  Run ID: {run_id}")
+            print(f"  Run dir: {run_dir}")
+        print(f"  Multiprocessing: {'enabled' if args.parallel else 'disabled'}")
+        if args.parallel:
+            print(f"  Workers: {args.workers or 'auto (CPU count)'}")
+        print(f"  Checkpoint: {checkpoint_path}")
+        print(f"  Timeout log: {timeout_log_path}")
+        print(f"  Export timelines: {'yes' if args.export_timelines else 'no'}")
+        if args.export_timelines:
+            print(f"  Timelines dir: {timelines_dir}")
+        print(f"  Monte Carlo income mode: {'yes' if args.mc_income else 'no'}")
+        if args.mc_income:
+            print(f"  MC scenarios: {args.mc_scenarios}")
+            print(f"  MC seed: {args.mc_seed}")
+            print(f"  MC rho: {args.mc_rho}")
+            print(f"  MC sigma: {args.mc_sigma}")
+            print(f"  MC shock prob: {args.mc_shock_prob}")
+            print(f"  MC shock severity: {args.mc_shock_severity}")
+        print(f"  Skip known timeouts: {'no' if args.include_known_timeouts else 'yes'}")
+        if args.restart:
+            print("  Restart: yes (ignoring existing checkpoint)")
+        print()
+
+        try:
+            if run_dir is not None:
+                _write_run_state(run_dir, "running")
+
+            if args.mc_income:
+                mc_output_path = args.mc_output or (mc_tmp_dir / "mc_income_results.csv")
+                mc_config = IncomeMCConfig(
+                    n_scenarios=args.mc_scenarios,
+                    seed=args.mc_seed,
+                    rho=args.mc_rho,
+                    sigma=args.mc_sigma,
+                    shock_prob=args.mc_shock_prob,
+                    shock_severity_mean=args.mc_shock_severity,
+                    shock_severity_std=max(args.mc_shock_severity * 0.25, 0.01),
+                    min_income_floor=1.0,
+                )
+                mc_config.validate()
+
+                if args.parallel:
+                    aggregates, scenario_rows, scenario_comparisons = run_monte_carlo_experiments_parallel(
+                        dataset_path=dataset_path,
+                        mc_config=mc_config,
+                        max_instances_per_group=args.max_instances,
+                        time_limit_seconds=args.time_limit,
+                        verbose=True,
+                        allowed_n_loans=tuple(args.n_loans),
+                        solver_name=initial_solver_name,
+                        n_workers=args.workers,
+                        checkpoint_path=checkpoint_path,
+                        restart=args.restart,
+                        ru_mode=args.ru,
+                    )
+                else:
+                    aggregates, scenario_rows, scenario_comparisons = run_monte_carlo_experiments(
+                        dataset_path=dataset_path,
+                        mc_config=mc_config,
+                        max_instances_per_group=args.max_instances,
+                        time_limit_seconds=args.time_limit,
+                        verbose=True,
+                        allowed_n_loans=tuple(args.n_loans),
+                        solver_name=initial_solver_name,
+                        checkpoint_path=checkpoint_path,
+                        restart=args.restart,
+                        ru_mode=args.ru,
+                    )
+                instance_csv, scenario_csv, metadata_json = _write_mc_outputs(
+                    output_path=mc_output_path,
+                    aggregates=aggregates,
+                    scenario_rows=scenario_rows,
+                    config=mc_config,
+                    run_id=run_id,
+                )
+
+                print("\n" + "=" * 60)
+                print("MONTE CARLO INCOME SUMMARY")
+                print("=" * 60)
+                print(f"Instances processed: {len(aggregates)}")
+                if aggregates:
+                    avg_infeasible = float(np.mean([r.infeasible_rate for r in aggregates]))
+                    avg_cost = float(np.mean([r.mean_cost for r in aggregates if np.isfinite(r.mean_cost)]))
+                    print(f"Average infeasible rate: {avg_infeasible:.3f}")
+                    if np.isfinite(avg_cost):
+                        print(f"Average mean cost: {avg_cost:,.2f}")
+                print(f"MC aggregate CSV: {instance_csv}")
+                print(f"MC scenario CSV: {scenario_csv}")
+                print(f"MC metadata JSON: {metadata_json}")
+                if scenario_comparisons:
+                    print("\n" + "=" * 60)
+                    print("MONTE CARLO BASELINE COMPARISON SUMMARY")
+                    print_summary(scenario_comparisons)
+                if run_dir is not None:
+                    _write_run_state(run_dir, "completed")
+                return 0
+
+            if args.parallel:
+                results = run_experiments_parallel(
+                    dataset_path=dataset_path,
+                    max_instances_per_group=args.max_instances,
+                    time_limit_seconds=args.time_limit,
+                    watchdog_grace_seconds=args.watchdog_grace_seconds,
+                    verbose=True,
+                    allowed_n_loans=tuple(args.n_loans),
+                    n_workers=args.workers,
+                    checkpoint_path=checkpoint_path,
+                    timeout_log_path=timeout_log_path,
+                    skip_known_timeouts=not args.include_known_timeouts,
+                    restart=args.restart,
+                    initial_solver_name=initial_solver_name,
+                    enable_solver_fallback=enable_solver_fallback,
+                    export_timelines=args.export_timelines,
+                    timelines_dir=timelines_dir,
+                    ru_mode=args.ru,
+                )
+            else:
+                results = run_experiments(
+                    dataset_path=dataset_path,
+                    max_instances_per_group=args.max_instances,
+                    time_limit_seconds=args.time_limit,
+                    verbose=True,
+                    allowed_n_loans=tuple(args.n_loans),
+                    checkpoint_path=checkpoint_path,
+                    timeout_log_path=timeout_log_path,
+                    skip_known_timeouts=not args.include_known_timeouts,
+                    restart=args.restart,
+                    solver_name=initial_solver_name,
+                    export_timelines=args.export_timelines,
+                    timelines_dir=timelines_dir,
+                    ru_mode=args.ru,
+                )
+
             print("\n" + "=" * 60)
-            print("MONTE CARLO BASELINE COMPARISON SUMMARY")
-            print_summary(scenario_comparisons)
-        return
+            print_summary(results)
 
-    if args.parallel:
-        results = run_experiments_parallel(
-            dataset_path=dataset_path,
-            max_instances_per_group=args.max_instances,
-            time_limit_seconds=args.time_limit,
-            watchdog_grace_seconds=args.watchdog_grace_seconds,
-            verbose=True,
-            allowed_n_loans=tuple(args.n_loans),
-            n_workers=args.workers,
-            checkpoint_path=checkpoint_path,
-            timeout_log_path=timeout_log_path,
-            skip_known_timeouts=not args.include_known_timeouts,
-            restart=args.restart,
-            initial_solver_name=initial_solver_name,
-            enable_solver_fallback=enable_solver_fallback,
-            export_timelines=args.export_timelines,
-            timelines_dir=timelines_dir,
-            ru_mode=args.ru,
-        )
-    else:
-        results = run_experiments(
-            dataset_path=dataset_path,
-            max_instances_per_group=args.max_instances,
-            time_limit_seconds=args.time_limit,
-            verbose=True,
-            allowed_n_loans=tuple(args.n_loans),
-            checkpoint_path=checkpoint_path,
-            timeout_log_path=timeout_log_path,
-            skip_known_timeouts=not args.include_known_timeouts,
-            restart=args.restart,
-            solver_name=initial_solver_name,
-            export_timelines=args.export_timelines,
-            timelines_dir=timelines_dir,
-            ru_mode=args.ru,
-        )
-
-    print("\n" + "=" * 60)
-    print_summary(results)
-
-    checkpoint = CheckpointManager(checkpoint_path)
-    csv_path = tmp_dir / "experiment_results.csv"
-    checkpoint.export_to_csv(csv_path)
-    if checkpoint.load_existing_results():
-        print(f"\nResults exported to: {csv_path}")
-    if timeout_log_path.exists():
-        print(f"Timeout instances logged to: {timeout_log_path}")
+            checkpoint = CheckpointManager(checkpoint_path)
+            csv_path = default_results_csv_path
+            checkpoint.export_to_csv(csv_path)
+            if checkpoint.load_existing_results():
+                print(f"\nResults exported to: {csv_path}")
+            if timeout_log_path.exists():
+                print(f"Timeout instances logged to: {timeout_log_path}")
+            if run_dir is not None:
+                _write_run_state(run_dir, "completed")
+            return 0
+        except KeyboardInterrupt:
+            if run_dir is not None:
+                _write_run_state(run_dir, "interrupted")
+            if LAST_SHUTDOWN_SIGNAL == getattr(signal, "SIGTERM", None):
+                print("\nReceived SIGTERM. Exiting...")
+                return 143
+            print("\nInterrupted by user. Exiting...")
+            return 130
+    finally:
+        _restore_shutdown_signal_handlers(previous_signal_handlers)
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\nInterrupted by user. Exiting...")
-        import os
-        os.system("pkill -f 'run-experiments' || true")
-        import sys
-        sys.exit(1)
+    sys.exit(main())
