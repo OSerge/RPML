@@ -1,0 +1,23 @@
+[project]
+name = "rpml"
+version = "0.1.0"
+description = "Repayment Planning for Multiple Loans optimization"
+requires-python = ">=3.10"
+dependencies = [
+    "ortools>=9.8",
+    "numpy>=1.24.0",
+    "pandas>=2.0.0",
+    "tqdm>=4.65.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+]
+
+[project.scripts]
+run-experiments = "rpml.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.9.11,<0.10"]
+build-backend = "uv_build"

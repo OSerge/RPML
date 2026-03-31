@@ -1,0 +1,1534 @@
+"""
+Run experiments on Rios-Solis dataset.
+
+Compares optimal MILP solutions with baseline strategies.
+"""
+
+import argparse
+import concurrent.futures as futures
+import csv
+import dataclasses
+import json
+import sys
+from contextlib import nullcontext
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import List
+
+import numpy as np
+from tqdm import tqdm
+
+from rpml.data_loader import load_all_instances, get_instances_by_size
+from rpml.milp_model import DEFAULT_SOLVER, FALLBACK_SOLVER, solve_rpml
+from rpml.baseline import debt_avalanche, debt_snowball
+from rpml.metrics import (
+    ComparisonResult,
+    MonteCarloAggregateResult,
+    aggregate_monte_carlo_results_from_comparisons,
+    compare_solutions,
+    print_summary,
+    validate_baseline_solution,
+)
+from rpml.checkpoint import CheckpointManager
+from rpml.income_monte_carlo import (
+    IncomeMCConfig,
+    derive_instance_seed,
+    replace_instance_income,
+    simulate_income_paths,
+)
+from rpml.timeline_export import export_timeline_json
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+TIMEOUT_CSV_COLUMNS = [
+    "instance_name",
+    "n_loans",
+    "time_limit_seconds",
+    "watchdog_timeout_seconds",
+    "reason",
+    "recorded_at_utc",
+]
+
+MC_INSTANCE_CSV_COLUMNS = [
+    "instance_name",
+    "n_loans",
+    "n_scenarios",
+    "feasible_scenarios",
+    "infeasible_scenarios",
+    "infeasible_rate",
+    "mean_cost",
+    "median_cost",
+    "p90_cost",
+    "mean_solve_time",
+    "p90_solve_time",
+    "p95_required_budget_overrun_proxy",
+]
+
+MC_SCENARIO_CSV_COLUMNS = [
+    "instance_name",
+    "scenario_name",
+    "scenario_index",
+    "status",
+    "objective_cost",
+    "solve_time",
+    "gap",
+]
+
+
+def resolve_solver_strategy(use_scip: bool) -> tuple[str, bool]:
+    """Return initial solver and whether HiGHS->SCIP fallback is enabled."""
+    if use_scip:
+        return FALLBACK_SOLVER, False
+    return DEFAULT_SOLVER, True
+
+
+def _serialize_mc_config(config: IncomeMCConfig) -> dict:
+    return dataclasses.asdict(config)
+
+
+def _write_mc_outputs(
+    output_path: Path,
+    aggregates: list[MonteCarloAggregateResult],
+    scenario_rows: list[dict],
+    config: IncomeMCConfig,
+) -> tuple[Path, Path, Path]:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    scenario_path = output_path.with_name(f"{output_path.stem}_scenarios{output_path.suffix}")
+    metadata_path = output_path.with_name(f"{output_path.stem}_meta.json")
+
+    with open(output_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=MC_INSTANCE_CSV_COLUMNS)
+        writer.writeheader()
+        for item in aggregates:
+            writer.writerow(dataclasses.asdict(item))
+
+    with open(scenario_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=MC_SCENARIO_CSV_COLUMNS)
+        writer.writeheader()
+        writer.writerows(scenario_rows)
+
+    metadata = {
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "income_mc_config": _serialize_mc_config(config),
+        "aggregates_file": str(output_path),
+        "scenarios_file": str(scenario_path),
+        "instance_count": len(aggregates),
+        "scenario_count": len(scenario_rows),
+    }
+    with open(metadata_path, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, ensure_ascii=False, indent=2)
+
+    return output_path, scenario_path, metadata_path
+
+
+def load_timeout_instances(timeout_log_path: Path | None) -> set[str]:
+    """Load timed-out instance names from timeout CSV log."""
+    if timeout_log_path is None or not timeout_log_path.exists():
+        return set()
+    out: set[str] = set()
+    try:
+        with open(timeout_log_path, "r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                name = (row.get("instance_name") or "").strip()
+                if name:
+                    out.add(name)
+    except Exception:
+        # Best-effort log loading; experiment should still run.
+        return set()
+    return out
+
+
+def append_timeout_records(timeout_log_path: Path | None, records: list[dict]) -> None:
+    """Append unique timeout records to CSV log."""
+    if timeout_log_path is None or not records:
+        return
+    timeout_log_path.parent.mkdir(parents=True, exist_ok=True)
+    existing = load_timeout_instances(timeout_log_path)
+    is_new_file = not timeout_log_path.exists()
+    with open(timeout_log_path, "a", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=TIMEOUT_CSV_COLUMNS)
+        if is_new_file:
+            writer.writeheader()
+        for rec in records:
+            name = rec.get("instance_name")
+            if not name or name in existing:
+                continue
+            writer.writerow(rec)
+            existing.add(name)
+
+
+def remove_timeout_instances(timeout_log_path: Path | None, instance_names: set[str]) -> None:
+    """Remove successfully solved instances from timeout CSV log."""
+    if timeout_log_path is None or not timeout_log_path.exists() or not instance_names:
+        return
+    try:
+        with open(timeout_log_path, "r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            rows = [row for row in reader if (row.get("instance_name") or "").strip() not in instance_names]
+        with open(timeout_log_path, "w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=TIMEOUT_CSV_COLUMNS)
+            writer.writeheader()
+            writer.writerows(rows)
+    except Exception:
+        # Best-effort cleanup only.
+        return
+
+
+def run_experiments(
+    dataset_path: Path,
+    max_instances_per_group: int | None = None,
+    time_limit_seconds: int = 300,
+    verbose: bool = True,
+    allowed_n_loans: tuple[int, ...] = (4, 8),
+    checkpoint_path: Path | None = None,
+    timeout_log_path: Path | None = None,
+    skip_known_timeouts: bool = True,
+    restart: bool = False,
+    solver_name: str = DEFAULT_SOLVER,
+    export_timelines: bool = False,
+    timelines_dir: Path | None = None,
+) -> List[ComparisonResult]:
+    """
+    Run experiments on all instances.
+
+    Results are saved incrementally to the checkpoint file. Already processed
+    instances are skipped on resume.
+    """
+    if verbose:
+        print("Loading instances...")
+
+    instances = load_all_instances(dataset_path)
+    grouped = get_instances_by_size(instances)
+
+    if verbose:
+        print(f"Loaded {len(instances)} instances")
+        for n, group in grouped.items():
+            print(f"  {n} loans: {len(group)} instances")
+
+    checkpoint = (
+        CheckpointManager(checkpoint_path, restart=restart)
+        if checkpoint_path
+        else None
+    )
+    processed = checkpoint.get_processed_instances() if checkpoint else set()
+    
+    if verbose and checkpoint_path:
+        if processed:
+            print(f"Resuming: {len(processed)} instances already in checkpoint")
+        else:
+            print("Starting fresh (no checkpoint found or checkpoint is empty)")
+
+    known_timeouts = load_timeout_instances(timeout_log_path) if skip_known_timeouts else set()
+    if verbose and timeout_log_path:
+        if known_timeouts:
+            print(f"Skipping {len(known_timeouts)} known timeout instance(s) from: {timeout_log_path}")
+        else:
+            print(f"No known timeout instances in: {timeout_log_path}")
+
+    results = []
+
+    for n_loans in allowed_n_loans:
+        group_instances = grouped.get(n_loans, [])
+
+        if not group_instances:
+            continue
+
+        if max_instances_per_group:
+            group_instances = group_instances[:max_instances_per_group]
+
+        if verbose:
+            print(f"\nProcessing {n_loans}-loan instances ({len(group_instances)} instances)...")
+
+        iterator = tqdm(group_instances, file=sys.stdout) if verbose else group_instances
+
+        for instance in iterator:
+            if instance.name in processed:
+                if verbose:
+                    tqdm.write(f"Skipping {instance.name} (already processed)", file=sys.stdout)
+                continue
+            if instance.name in known_timeouts:
+                if verbose:
+                    tqdm.write(f"Skipping {instance.name} (known timeout)", file=sys.stdout)
+                continue
+
+            try:
+                optimal_solution = solve_rpml(
+                    instance,
+                    time_limit_seconds=time_limit_seconds,
+                    solver_name=solver_name,
+                )
+
+                avalanche_solution = debt_avalanche(instance)
+                snowball_solution = debt_snowball(instance)
+                avalanche_valid, avalanche_errors, avalanche_final_balance = validate_baseline_solution(
+                    avalanche_solution, instance
+                )
+                snowball_valid, snowball_errors, snowball_final_balance = validate_baseline_solution(
+                    snowball_solution, instance
+                )
+                avalanche_feasible = avalanche_valid and avalanche_final_balance < 1.0
+                snowball_feasible = snowball_valid and snowball_final_balance < 1.0
+
+                if optimal_solution.status not in ["OPTIMAL", "FEASIBLE"]:
+                    if verbose:
+                        tqdm.write(f"Warning: {instance.name} MILP status: {optimal_solution.status}", file=sys.stdout)
+                if verbose and not avalanche_valid:
+                    tqdm.write(
+                        f"  {instance.name}: Debt Avalanche invalid ({'; '.join(avalanche_errors[:2])})",
+                        file=sys.stdout,
+                    )
+                if verbose and not avalanche_feasible:
+                    tqdm.write(
+                        f"  {instance.name}: Debt Avalanche not repaid by T (max balance: {avalanche_final_balance:,.0f})",
+                        file=sys.stdout,
+                    )
+                if verbose and not snowball_valid:
+                    tqdm.write(
+                        f"  {instance.name}: Debt Snowball invalid ({'; '.join(snowball_errors[:2])})",
+                        file=sys.stdout,
+                    )
+                if verbose and not snowball_feasible:
+                    tqdm.write(
+                        f"  {instance.name}: Debt Snowball not repaid by T (max balance: {snowball_final_balance:,.0f})",
+                        file=sys.stdout,
+                    )
+
+                comparison = compare_solutions(
+                    optimal=optimal_solution,
+                    avalanche=avalanche_solution,
+                    snowball=snowball_solution,
+                    instance_name=instance.name,
+                    n_loans=n_loans,
+                    avalanche_valid=avalanche_valid,
+                    avalanche_repaid_by_T=avalanche_feasible,
+                    avalanche_final_balance=avalanche_final_balance,
+                    snowball_valid=snowball_valid,
+                    snowball_repaid_by_T=snowball_feasible,
+                    snowball_final_balance=snowball_final_balance,
+                )
+
+                if export_timelines and timelines_dir is not None:
+                    export_timeline_json(
+                        output_dir=timelines_dir,
+                        instance=instance,
+                        comparison=comparison,
+                        optimal_solution=optimal_solution,
+                        avalanche_solution=avalanche_solution,
+                        snowball_solution=snowball_solution,
+                    )
+
+                results.append(comparison)
+                if checkpoint:
+                    checkpoint.save_result(comparison)
+                remove_timeout_instances(timeout_log_path, {instance.name})
+                processed.add(instance.name)
+
+            except Exception as e:
+                if verbose:
+                    print(f"\nError processing {instance.name}: {e}")
+                continue
+
+    if checkpoint:
+        results = list(checkpoint.load_existing_results().values())
+    return results
+
+
+def run_monte_carlo_experiments(
+    dataset_path: Path,
+    mc_config: IncomeMCConfig,
+    max_instances_per_group: int | None = None,
+    time_limit_seconds: int = 300,
+    verbose: bool = True,
+    allowed_n_loans: tuple[int, ...] = (4, 8),
+    solver_name: str = DEFAULT_SOLVER,
+    checkpoint_path: Path | None = None,
+    restart: bool = False,
+) -> tuple[list[MonteCarloAggregateResult], list[dict], list[ComparisonResult]]:
+    if verbose:
+        print("Loading instances...")
+
+    instances = load_all_instances(dataset_path)
+    grouped = get_instances_by_size(instances)
+
+    if verbose:
+        print(f"Loaded {len(instances)} instances")
+        print(f"  Selected loan counts: {list(allowed_n_loans)}")
+        for n_loans in allowed_n_loans:
+            group_instances = grouped.get(n_loans, [])
+            if max_instances_per_group:
+                group_instances = group_instances[:max_instances_per_group]
+            print(f"  {n_loans} loans (selected): {len(group_instances)} instances")
+
+    checkpoint = (
+        CheckpointManager(checkpoint_path, restart=restart)
+        if checkpoint_path is not None
+        else None
+    )
+    checkpoint_results = checkpoint.load_existing_results() if checkpoint is not None else {}
+    all_instances = []
+    for n_loans in allowed_n_loans:
+        group_instances = grouped.get(n_loans, [])
+        if max_instances_per_group:
+            group_instances = group_instances[:max_instances_per_group]
+        all_instances.extend(group_instances)
+    selected_base_instances = {inst.name for inst in all_instances}
+    existing_by_instance: dict[str, dict[int, ComparisonResult]] = {
+        inst_name: _get_monte_carlo_scenario_results(
+            base_instance_name=inst_name,
+            expected_scenarios=mc_config.n_scenarios,
+            comparison_by_name=checkpoint_results,
+        )
+        for inst_name in selected_base_instances
+    }
+    completed_instances = {
+        inst_name
+        for inst_name in selected_base_instances
+        if len(existing_by_instance.get(inst_name, {})) == mc_config.n_scenarios
+    }
+    if verbose and checkpoint_path is not None:
+        if completed_instances:
+            print(
+                f"Resuming Monte Carlo: {len(completed_instances)} base instance(s) fully completed in checkpoint"
+            )
+        else:
+            print("Monte Carlo checkpoint has no fully completed base instances")
+
+    aggregates: list[MonteCarloAggregateResult] = []
+    scenario_rows: list[dict] = []
+    scenario_comparisons: list[ComparisonResult] = []
+
+    for n_loans in allowed_n_loans:
+        group_instances = grouped.get(n_loans, [])
+
+        if not group_instances:
+            continue
+
+        if max_instances_per_group:
+            group_instances = group_instances[:max_instances_per_group]
+
+        if verbose:
+            print(f"\nProcessing {n_loans}-loan instances ({len(group_instances)} instances) with Monte Carlo...")
+
+        iterator = tqdm(group_instances, file=sys.stdout) if verbose else group_instances
+
+        for instance in iterator:
+            if instance.name in completed_instances:
+                if verbose:
+                    tqdm.write(
+                        f"Skipping {instance.name} (Monte Carlo fully completed in checkpoint)",
+                        file=sys.stdout,
+                    )
+                continue
+            try:
+                existing_results = existing_by_instance.get(instance.name, {})
+                if verbose and existing_results:
+                    tqdm.write(
+                        _format_monte_carlo_resume_line(
+                            base_instance_name=instance.name,
+                            done_scenarios=len(existing_results),
+                            total_scenarios=mc_config.n_scenarios,
+                        ),
+                        file=sys.stdout,
+                    )
+                aggregate, instance_rows, instance_comparisons = _run_monte_carlo_for_instance(
+                    instance=instance,
+                    mc_config=mc_config,
+                    time_limit_seconds=time_limit_seconds,
+                    solver_name=solver_name,
+                    checkpoint_path=checkpoint_path,
+                    existing_scenario_results=existing_results,
+                )
+                aggregates.append(aggregate)
+                scenario_rows.extend(instance_rows)
+                scenario_comparisons.extend(instance_comparisons)
+            except Exception as e:
+                if verbose:
+                    print(f"\nError processing {instance.name}: {e}")
+                continue
+
+    if checkpoint is not None:
+        checkpoint_results = checkpoint.load_existing_results()
+        return _build_monte_carlo_outputs_from_checkpoint(
+            comparison_by_name=checkpoint_results,
+            expected_scenarios=mc_config.n_scenarios,
+            selected_base_instances=selected_base_instances,
+        )
+    _sort_monte_carlo_outputs(aggregates, scenario_rows, scenario_comparisons)
+    return aggregates, scenario_rows, scenario_comparisons
+
+
+def _run_monte_carlo_for_instance(
+    *,
+    instance,
+    mc_config: IncomeMCConfig,
+    time_limit_seconds: int,
+    solver_name: str,
+    checkpoint_path: Path | str | None = None,
+    existing_scenario_results: dict[int, ComparisonResult] | None = None,
+) -> tuple[MonteCarloAggregateResult, list[dict], list[ComparisonResult]]:
+    instance_seed = derive_instance_seed(mc_config.seed, instance.name)
+    instance_mc_config = dataclasses.replace(mc_config, seed=instance_seed)
+    incomes = simulate_income_paths(instance.monthly_income, instance_mc_config)
+
+    existing_scenario_results = existing_scenario_results or {}
+    scenario_rows: list[dict] = []
+    scenario_comparisons: list[ComparisonResult] = []
+    checkpoint = CheckpointManager(Path(checkpoint_path)) if checkpoint_path is not None else None
+    for idx, scenario_income in enumerate(incomes):
+        existing = existing_scenario_results.get(idx)
+        if existing is not None:
+            scenario_comparisons.append(existing)
+            scenario_rows.append(
+                {
+                    "instance_name": instance.name,
+                    "scenario_name": existing.instance_name,
+                    "scenario_index": idx,
+                    "status": existing.optimal_status,
+                    "objective_cost": existing.optimal_cost,
+                    "solve_time": existing.optimal_solve_time,
+                    "gap": existing.optimal_gap,
+                }
+            )
+            continue
+        scenario_instance = replace_instance_income(instance, scenario_income, str(idx))
+        solution = solve_rpml(
+            scenario_instance,
+            time_limit_seconds=time_limit_seconds,
+            solver_name=solver_name,
+        )
+        scenario_rows.append(
+            {
+                "instance_name": instance.name,
+                "scenario_name": scenario_instance.name,
+                "scenario_index": idx,
+                "status": solution.status,
+                "objective_cost": solution.objective_value,
+                "solve_time": solution.solve_time,
+                "gap": solution.gap,
+            }
+        )
+        avalanche_solution = debt_avalanche(scenario_instance)
+        snowball_solution = debt_snowball(scenario_instance)
+        avalanche_valid, _, avalanche_final_balance = validate_baseline_solution(
+            avalanche_solution, scenario_instance
+        )
+        snowball_valid, _, snowball_final_balance = validate_baseline_solution(
+            snowball_solution, scenario_instance
+        )
+        avalanche_feasible = avalanche_valid and avalanche_final_balance < 1.0
+        snowball_feasible = snowball_valid and snowball_final_balance < 1.0
+        comparison = compare_solutions(
+                optimal=solution,
+                avalanche=avalanche_solution,
+                snowball=snowball_solution,
+                instance_name=scenario_instance.name,
+                n_loans=instance.n,
+                avalanche_valid=avalanche_valid,
+                avalanche_repaid_by_T=avalanche_feasible,
+                avalanche_final_balance=avalanche_final_balance,
+                snowball_valid=snowball_valid,
+                snowball_repaid_by_T=snowball_feasible,
+                snowball_final_balance=snowball_final_balance,
+            )
+        scenario_comparisons.append(comparison)
+        if checkpoint is not None:
+            checkpoint.save_result(comparison)
+
+    aggregate = aggregate_monte_carlo_results_from_comparisons(
+        instance_name=instance.name,
+        n_loans=instance.n,
+        scenario_results=scenario_comparisons,
+    )
+    return aggregate, scenario_rows, scenario_comparisons
+
+
+def process_monte_carlo_instance(args_tuple):
+    """
+    Process one base instance in Monte Carlo mode (for multiprocessing).
+    """
+    (
+        instance,
+        mc_config,
+        time_limit_seconds,
+        solver_name,
+        checkpoint_path,
+        existing_scenario_results,
+    ) = args_tuple
+    try:
+        aggregate, scenario_rows, scenario_comparisons = _run_monte_carlo_for_instance(
+            instance=instance,
+            mc_config=mc_config,
+            time_limit_seconds=time_limit_seconds,
+            solver_name=solver_name,
+            checkpoint_path=checkpoint_path,
+            existing_scenario_results=existing_scenario_results,
+        )
+        return ("ok", aggregate, scenario_rows, scenario_comparisons)
+    except Exception as e:
+        return ("error", instance.name, str(e))
+
+
+def _scenario_name_sort_key(name: str) -> tuple[str, int, str]:
+    if "__mc_" in name:
+        base, suffix = name.rsplit("__mc_", 1)
+        if suffix.isdigit():
+            return (base, int(suffix), name)
+    return (name, 10**9, name)
+
+
+def _sort_monte_carlo_outputs(
+    aggregates: list[MonteCarloAggregateResult],
+    scenario_rows: list[dict],
+    scenario_comparisons: list[ComparisonResult],
+) -> None:
+    aggregates.sort(key=lambda item: item.instance_name)
+    scenario_rows.sort(
+        key=lambda row: (
+            row.get("instance_name", ""),
+            int(row.get("scenario_index", 0)),
+            row.get("scenario_name", ""),
+        )
+    )
+    scenario_comparisons.sort(key=lambda item: _scenario_name_sort_key(item.instance_name))
+
+
+def _split_monte_carlo_scenario_name(name: str) -> tuple[str, int] | None:
+    if "__mc_" not in name:
+        return None
+    base, suffix = name.rsplit("__mc_", 1)
+    if not suffix.isdigit():
+        return None
+    return base, int(suffix)
+
+
+def _is_monte_carlo_instance_complete(
+    base_instance_name: str,
+    expected_scenarios: int,
+    comparison_by_name: dict[str, ComparisonResult],
+) -> bool:
+    return len(
+        _get_monte_carlo_scenario_results(
+            base_instance_name=base_instance_name,
+            expected_scenarios=expected_scenarios,
+            comparison_by_name=comparison_by_name,
+        )
+    ) == expected_scenarios
+
+
+def _get_monte_carlo_scenario_results(
+    *,
+    base_instance_name: str,
+    expected_scenarios: int,
+    comparison_by_name: dict[str, ComparisonResult],
+) -> dict[int, ComparisonResult]:
+    out: dict[int, ComparisonResult] = {}
+    for idx in range(expected_scenarios):
+        scenario_name = f"{base_instance_name}__mc_{idx}"
+        result = comparison_by_name.get(scenario_name)
+        if result is not None:
+            out[idx] = result
+    return out
+
+
+def _build_monte_carlo_outputs_from_checkpoint(
+    comparison_by_name: dict[str, ComparisonResult],
+    expected_scenarios: int,
+    selected_base_instances: set[str],
+) -> tuple[list[MonteCarloAggregateResult], list[dict], list[ComparisonResult]]:
+    grouped: dict[str, list[ComparisonResult]] = {}
+    for result in comparison_by_name.values():
+        parsed = _split_monte_carlo_scenario_name(result.instance_name)
+        if parsed is None:
+            continue
+        base_name, _ = parsed
+        if base_name not in selected_base_instances:
+            continue
+        grouped.setdefault(base_name, []).append(result)
+
+    aggregates: list[MonteCarloAggregateResult] = []
+    scenario_rows: list[dict] = []
+    scenario_comparisons: list[ComparisonResult] = []
+
+    for base_name, results in grouped.items():
+        by_idx: dict[int, ComparisonResult] = {}
+        for result in results:
+            parsed = _split_monte_carlo_scenario_name(result.instance_name)
+            if parsed is None:
+                continue
+            _, idx = parsed
+            by_idx[idx] = result
+        if len(by_idx) < expected_scenarios:
+            continue
+        ordered = [by_idx[idx] for idx in range(expected_scenarios) if idx in by_idx]
+        if len(ordered) != expected_scenarios:
+            continue
+
+        aggregates.append(
+            aggregate_monte_carlo_results_from_comparisons(
+                instance_name=base_name,
+                n_loans=ordered[0].n_loans,
+                scenario_results=ordered,
+            )
+        )
+        scenario_comparisons.extend(ordered)
+        for idx, result in enumerate(ordered):
+            scenario_rows.append(
+                {
+                    "instance_name": base_name,
+                    "scenario_name": result.instance_name,
+                    "scenario_index": idx,
+                    "status": result.optimal_status,
+                    "objective_cost": result.optimal_cost,
+                    "solve_time": result.optimal_solve_time,
+                    "gap": result.optimal_gap,
+                }
+            )
+
+    _sort_monte_carlo_outputs(aggregates, scenario_rows, scenario_comparisons)
+    return aggregates, scenario_rows, scenario_comparisons
+
+
+def _format_monte_carlo_resume_line(
+    base_instance_name: str,
+    done_scenarios: int,
+    total_scenarios: int,
+) -> str:
+    remaining = max(total_scenarios - done_scenarios, 0)
+    return (
+        f"{base_instance_name}: resumed {done_scenarios}/{total_scenarios}, "
+        f"remaining {remaining}"
+    )
+
+
+def run_monte_carlo_experiments_parallel(
+    dataset_path: Path,
+    mc_config: IncomeMCConfig,
+    max_instances_per_group: int | None = None,
+    time_limit_seconds: int = 300,
+    verbose: bool = True,
+    allowed_n_loans: tuple[int, ...] = (4, 8),
+    solver_name: str = DEFAULT_SOLVER,
+    n_workers: int | None = None,
+    checkpoint_path: Path | None = None,
+    restart: bool = False,
+) -> tuple[list[MonteCarloAggregateResult], list[dict], list[ComparisonResult]]:
+    from multiprocessing import cpu_count
+
+    if verbose:
+        print("Loading instances...")
+
+    instances = load_all_instances(dataset_path)
+    grouped = get_instances_by_size(instances)
+
+    if verbose:
+        print(f"Loaded {len(instances)} instances")
+        print(f"  Selected loan counts: {list(allowed_n_loans)}")
+        for n_loans in allowed_n_loans:
+            group_instances = grouped.get(n_loans, [])
+            if max_instances_per_group:
+                group_instances = group_instances[:max_instances_per_group]
+            print(f"  {n_loans} loans (selected): {len(group_instances)} instances")
+
+    all_instances = []
+    for n_loans in allowed_n_loans:
+        group_instances = grouped.get(n_loans, [])
+        if not group_instances:
+            continue
+        if max_instances_per_group:
+            group_instances = group_instances[:max_instances_per_group]
+        all_instances.extend(group_instances)
+
+    checkpoint = (
+        CheckpointManager(checkpoint_path, restart=restart)
+        if checkpoint_path is not None
+        else None
+    )
+    checkpoint_results = checkpoint.load_existing_results() if checkpoint is not None else {}
+    selected_base_instances = {inst.name for inst in all_instances}
+    existing_by_instance: dict[str, dict[int, ComparisonResult]] = {
+        inst_name: _get_monte_carlo_scenario_results(
+            base_instance_name=inst_name,
+            expected_scenarios=mc_config.n_scenarios,
+            comparison_by_name=checkpoint_results,
+        )
+        for inst_name in selected_base_instances
+    }
+    completed_instances = {
+        inst_name
+        for inst_name in selected_base_instances
+        if len(existing_by_instance.get(inst_name, {})) == mc_config.n_scenarios
+    }
+    instances_to_process = [
+        inst for inst in all_instances if inst.name not in completed_instances
+    ]
+
+    if verbose:
+        print(
+            f"\nProcessing {len(instances_to_process)} instances in parallel with Monte Carlo..."
+        )
+        if completed_instances:
+            print(
+                f"  (Skipped {len(completed_instances)} base instance(s) fully completed in checkpoint)"
+            )
+
+    args_list = []
+    for instance in instances_to_process:
+        existing_results = existing_by_instance.get(instance.name, {})
+        if verbose and existing_results:
+            print(
+                _format_monte_carlo_resume_line(
+                    base_instance_name=instance.name,
+                    done_scenarios=len(existing_results),
+                    total_scenarios=mc_config.n_scenarios,
+                )
+            )
+        args_list.append(
+            (
+                instance,
+                mc_config,
+                time_limit_seconds,
+                solver_name,
+                str(checkpoint_path) if checkpoint_path is not None else None,
+                existing_results,
+            )
+        )
+
+    worker_count = n_workers or cpu_count()
+    if verbose:
+        print(f"Using {worker_count} workers")
+
+    aggregates: list[MonteCarloAggregateResult] = []
+    scenario_rows: list[dict] = []
+    scenario_comparisons: list[ComparisonResult] = []
+    executor = None
+
+    def _kill_executor_workers(current_executor) -> None:
+        processes = getattr(current_executor, "_processes", {}) or {}
+        for proc in processes.values():
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        try:
+            current_executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+
+    pbar_ctx = tqdm(total=len(args_list), file=sys.stdout) if verbose else nullcontext()
+    try:
+        with pbar_ctx as pbar:
+            with futures.ProcessPoolExecutor(max_workers=worker_count) as executor:
+                submitted = [executor.submit(process_monte_carlo_instance, args) for args in args_list]
+                for future in futures.as_completed(submitted):
+                    result = future.result()
+                    if result and result[0] == "ok":
+                        aggregates.append(result[1])
+                        scenario_rows.extend(result[2])
+                        scenario_comparisons.extend(result[3])
+                    elif result and result[0] == "error" and verbose:
+                        print(f"Error processing {result[1]}: {result[2]}")
+                    if pbar is not None:
+                        pbar.update(1)
+    except KeyboardInterrupt:
+        if verbose:
+            print("\nInterrupted by user. Shutting down Monte Carlo workers...")
+        if executor is not None:
+            _kill_executor_workers(executor)
+        raise
+
+    if checkpoint is not None:
+        checkpoint_results = checkpoint.load_existing_results()
+        return _build_monte_carlo_outputs_from_checkpoint(
+            comparison_by_name=checkpoint_results,
+            expected_scenarios=mc_config.n_scenarios,
+            selected_base_instances=selected_base_instances,
+        )
+    _sort_monte_carlo_outputs(aggregates, scenario_rows, scenario_comparisons)
+    return aggregates, scenario_rows, scenario_comparisons
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Run RPML experiments on Rios-Solis dataset",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    
+    parser.add_argument(
+        "-m", "--max-instances",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Maximum instances per loan group (None = all)",
+    )
+    
+    parser.add_argument(
+        "-n", "--n-loans",
+        type=int,
+        nargs="+",
+        default=[4, 8],
+        metavar="N",
+        help="Loan counts to process (e.g., -n 4 8 12)",
+    )
+    
+    parser.add_argument(
+        "-t", "--time-limit",
+        type=int,
+        default=300,
+        metavar="SEC",
+        help="Time limit for MILP solver in seconds",
+    )
+    parser.add_argument(
+        "--watchdog-grace-seconds",
+        type=int,
+        default=15,
+        metavar="SEC",
+        help="Extra seconds above --time-limit before watchdog kills a stuck worker",
+    )
+    
+    parser.add_argument(
+        "-p", "--parallel",
+        action="store_true",
+        help="Enable multiprocessing for parallel instance solving",
+    )
+    
+    parser.add_argument(
+        "-w", "--workers",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Number of parallel workers (default: CPU count)",
+    )
+    
+    parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Path to checkpoint file (default: tmp/experiment_results_checkpoint.jsonl)",
+    )
+    
+    parser.add_argument(
+        "--restart",
+        action="store_true",
+        help="Ignore existing checkpoint and start fresh",
+    )
+    
+    parser.add_argument(
+        "--summary",
+        action="store_true",
+        help="Show summary of existing checkpoint results and exit (don't run experiments)",
+    )
+    parser.add_argument(
+        "--timeout-log",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Path to timeout CSV log (default: tmp/timeout_instances.csv)",
+    )
+    parser.add_argument(
+        "--include-known-timeouts",
+        action="store_true",
+        help="Process instances listed in timeout log instead of skipping them",
+    )
+    parser.add_argument(
+        "--scip",
+        action="store_true",
+        help="Use SCIP directly for all instances and disable HiGHS->SCIP fallback",
+    )
+    parser.add_argument(
+        "--export-timelines",
+        action="store_true",
+        help="Export per-instance monthly trajectories to JSON files",
+    )
+    parser.add_argument(
+        "--timelines-dir",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Directory for timeline JSON files (default: tmp/timelines)",
+    )
+    parser.add_argument(
+        "--mc-income",
+        action="store_true",
+        help="Enable Monte Carlo simulation mode for monthly income scenarios",
+    )
+    parser.add_argument(
+        "--mc-scenarios",
+        type=int,
+        default=16,
+        metavar="N",
+        help="Number of Monte Carlo scenarios per instance",
+    )
+    parser.add_argument(
+        "--mc-seed",
+        type=int,
+        default=42,
+        metavar="N",
+        help="Base seed for Monte Carlo scenario generation",
+    )
+    parser.add_argument(
+        "--mc-rho",
+        type=float,
+        default=0.55,
+        metavar="RHO",
+        help="AR(1) correlation for Monte Carlo income shocks",
+    )
+    parser.add_argument(
+        "--mc-sigma",
+        type=float,
+        default=0.15,
+        metavar="SIGMA",
+        help="Log-scale volatility for Monte Carlo income shocks",
+    )
+    parser.add_argument(
+        "--mc-shock-prob",
+        type=float,
+        default=0.04,
+        metavar="P",
+        help="Per-month probability of negative income shock",
+    )
+    parser.add_argument(
+        "--mc-shock-severity",
+        type=float,
+        default=0.30,
+        metavar="S",
+        help="Mean severity of negative income shock in [0, 1]",
+    )
+    parser.add_argument(
+        "--mc-output",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="CSV path for Monte Carlo aggregated results (default: tmp/mc_income_results.csv)",
+    )
+    
+    return parser.parse_args()
+
+
+def process_instance(args_tuple):
+    """Process a single instance (for multiprocessing)."""
+    (
+        instance,
+        time_limit_seconds,
+        verbose,
+        checkpoint_path,
+        processed_set,
+        solver_name,
+        export_timelines,
+        timelines_dir_str,
+    ) = args_tuple
+
+    if processed_set is not None and instance.name in processed_set:
+        return ("skip_processed", instance.name)
+
+    try:
+        optimal_solution = solve_rpml(
+            instance,
+            time_limit_seconds=time_limit_seconds,
+            solver_name=solver_name,
+        )
+
+        avalanche_solution = debt_avalanche(instance)
+        snowball_solution = debt_snowball(instance)
+        avalanche_valid, _, avalanche_final_balance = validate_baseline_solution(
+            avalanche_solution, instance
+        )
+        snowball_valid, _, snowball_final_balance = validate_baseline_solution(
+            snowball_solution, instance
+        )
+        avalanche_feasible = avalanche_valid and avalanche_final_balance < 1.0
+        snowball_feasible = snowball_valid and snowball_final_balance < 1.0
+
+        comparison = compare_solutions(
+            optimal=optimal_solution,
+            avalanche=avalanche_solution,
+            snowball=snowball_solution,
+            instance_name=instance.name,
+            n_loans=instance.n,
+            avalanche_valid=avalanche_valid,
+            avalanche_repaid_by_T=avalanche_feasible,
+            avalanche_final_balance=avalanche_final_balance,
+            snowball_valid=snowball_valid,
+            snowball_repaid_by_T=snowball_feasible,
+            snowball_final_balance=snowball_final_balance,
+        )
+
+        if export_timelines and timelines_dir_str is not None:
+            export_timeline_json(
+                output_dir=Path(timelines_dir_str),
+                instance=instance,
+                comparison=comparison,
+                optimal_solution=optimal_solution,
+                avalanche_solution=avalanche_solution,
+                snowball_solution=snowball_solution,
+            )
+
+        if checkpoint_path is not None:
+            checkpoint = CheckpointManager(Path(str(checkpoint_path)))
+            checkpoint.save_result(comparison)
+        status = optimal_solution.status
+        result_kind = "ok" if status in ("OPTIMAL", "FEASIBLE") else "ok_infeasible"
+        return (result_kind, comparison, solver_name)
+
+    except Exception as e:
+        return ("error", instance.name, str(e), solver_name)
+
+
+def run_experiments_parallel(
+    dataset_path: Path,
+    max_instances_per_group: int | None = None,
+    time_limit_seconds: int = 300,
+    watchdog_grace_seconds: int = 15,
+    verbose: bool = True,
+    allowed_n_loans: tuple[int, ...] = (4, 8),
+    n_workers: int | None = None,
+    checkpoint_path: Path | None = None,
+    timeout_log_path: Path | None = None,
+    skip_known_timeouts: bool = True,
+    restart: bool = False,
+    initial_solver_name: str = DEFAULT_SOLVER,
+    enable_solver_fallback: bool = True,
+    export_timelines: bool = False,
+    timelines_dir: Path | None = None,
+) -> List[ComparisonResult]:
+    """
+    Run experiments on all instances using multiprocessing.
+
+    Results are saved incrementally to the checkpoint file. Already processed
+    instances are skipped on resume.
+    """
+    from multiprocessing import cpu_count
+
+    if verbose:
+        print("Loading instances...")
+
+    instances = load_all_instances(dataset_path)
+    grouped = get_instances_by_size(instances)
+
+    if verbose:
+        print(f"Loaded {len(instances)} instances")
+        for n, group in grouped.items():
+            print(f"  {n} loans: {len(group)} instances")
+
+    all_instances = []
+    for n_loans in allowed_n_loans:
+        group_instances = grouped.get(n_loans, [])
+
+        if not group_instances:
+            continue
+
+        if max_instances_per_group:
+            group_instances = group_instances[:max_instances_per_group]
+
+        all_instances.extend(group_instances)
+
+    checkpoint = (
+        CheckpointManager(checkpoint_path, restart=restart)
+        if checkpoint_path
+        else None
+    )
+    processed = checkpoint.get_processed_instances() if checkpoint else set()
+    
+    if verbose and checkpoint_path:
+        if processed:
+            print(f"Resuming: {len(processed)} instances already in checkpoint")
+        else:
+            print("Starting fresh (no checkpoint found or checkpoint is empty)")
+
+    known_timeouts = load_timeout_instances(timeout_log_path) if skip_known_timeouts else set()
+    to_process = [
+        inst
+        for inst in all_instances
+        if inst.name not in processed and inst.name not in known_timeouts
+    ]
+    if verbose:
+        print(f"\nProcessing {len(to_process)} instances in parallel...")
+        if processed:
+            print(f"  (Skipped {len(all_instances) - len(to_process)} already processed)")
+        if known_timeouts:
+            print(f"  (Skipped {len(known_timeouts)} known timeout instance(s))")
+
+    ck_path_str = str(checkpoint_path) if checkpoint_path else None
+    timelines_dir_str = str(timelines_dir) if timelines_dir else None
+    args_list = [
+        (
+            inst,
+            time_limit_seconds,
+            False,
+            ck_path_str,
+            processed,
+            initial_solver_name,
+            export_timelines,
+            timelines_dir_str,
+        )
+        for inst in to_process
+    ]
+
+    n_workers = n_workers or cpu_count()
+    if verbose:
+        print(f"Using {n_workers} workers")
+
+    # External hard timeout per worker task. Keep it close to the MILP limit so
+    # a hung solver does not stall the pool much longer than requested.
+    per_instance_timeout = time_limit_seconds + watchdog_grace_seconds
+
+    from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
+    import time
+    from collections import deque
+
+    def _kill_executor_workers(executor: ProcessPoolExecutor) -> None:
+        # Hard-stop worker processes when a solver run hangs (ignores internal limits).
+        processes = getattr(executor, "_processes", {}) or {}
+        for proc in processes.values():
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        executor.shutdown(wait=False, cancel_futures=True)
+
+    raw_results = []
+    pending_args = deque(args_list)
+    completed_instances = set(processed)
+    pbar_ctx = tqdm(total=len(args_list), file=sys.stdout) if verbose else nullcontext()
+
+    try:
+        with pbar_ctx as pbar:
+            while pending_args:
+                executor = ProcessPoolExecutor(max_workers=n_workers)
+                inflight: dict = {}
+                try:
+                    while pending_args and len(inflight) < n_workers:
+                        args = pending_args.popleft()
+                        future = executor.submit(process_instance, args)
+                        inflight[future] = (args, time.time())
+
+                    while inflight:
+                        done, _ = wait(inflight.keys(), timeout=1.0, return_when=FIRST_COMPLETED)
+
+                        # Consume completed futures first
+                        for future in done:
+                            (args, _) = inflight.pop(future)
+                            inst = args[0]
+                            try:
+                                result = future.result()
+                                raw_results.append(result)
+                                if result and result[0] in ("ok", "ok_infeasible"):
+                                    remove_timeout_instances(timeout_log_path, {inst.name})
+                                    completed_instances.add(inst.name)
+                            except Exception as e:
+                                raw_results.append(("error", inst.name, str(e)))
+                            finally:
+                                if pbar is not None:
+                                    pbar.update(1)
+
+                        # Backfill workers
+                        while pending_args and len(inflight) < n_workers:
+                            args = pending_args.popleft()
+                            future = executor.submit(process_instance, args)
+                            inflight[future] = (args, time.time())
+
+                        # Watchdog: if any task runs too long, kill the whole pool and continue.
+                        now = time.time()
+                        timed_out = [
+                            (future, args)
+                            for future, (args, started_at) in inflight.items()
+                            if (now - started_at) > per_instance_timeout
+                        ]
+                        if timed_out:
+                            timeout_names = [args[0].name for _, args in timed_out]
+                            timeout_records = []
+                            for _, args in timed_out:
+                                inst = args[0]
+                                solver_name = args[5]
+                                if enable_solver_fallback and solver_name == DEFAULT_SOLVER:
+                                    retry_args = (
+                                        inst,
+                                        time_limit_seconds,
+                                        False,
+                                        ck_path_str,
+                                        processed,
+                                        FALLBACK_SOLVER,
+                                        export_timelines,
+                                        timelines_dir_str,
+                                    )
+                                    pending_args.appendleft(retry_args)
+                                    if verbose:
+                                        print(f"\nRetrying {inst.name} with {FALLBACK_SOLVER} after {DEFAULT_SOLVER} timeout")
+                                else:
+                                    raw_results.append(
+                                        ("error", inst.name, f"Watchdog timeout > {per_instance_timeout:.0f}s after {solver_name}")
+                                    )
+                                    completed_instances.add(inst.name)
+                                    timeout_records.append(
+                                        {
+                                            "instance_name": inst.name,
+                                            "n_loans": inst.n,
+                                            "time_limit_seconds": time_limit_seconds,
+                                            "watchdog_timeout_seconds": int(per_instance_timeout),
+                                            "reason": f"watchdog_timeout_after_{solver_name.lower()}",
+                                            "recorded_at_utc": datetime.now(timezone.utc).isoformat(),
+                                        }
+                                    )
+                                    if pbar is not None:
+                                        pbar.update(1)
+                            append_timeout_records(timeout_log_path, timeout_records)
+
+                            # Requeue non-timeout in-flight tasks (they were killed with the pool).
+                            for future, (args, _) in inflight.items():
+                                if args[0].name not in timeout_names:
+                                    pending_args.appendleft(args)
+                            inflight.clear()
+
+                            if verbose:
+                                print(
+                                    f"\nWatchdog: killed worker pool due to timeout on {len(timeout_names)} instance(s): "
+                                    + ", ".join(timeout_names[:3])
+                                    + ("..." if len(timeout_names) > 3 else "")
+                                )
+                            _kill_executor_workers(executor)
+                            break
+                except KeyboardInterrupt:
+                    print("\nInterrupted by user. Shutting down workers...")
+                    _kill_executor_workers(executor)
+                    raise
+                finally:
+                    try:
+                        executor.shutdown(wait=False, cancel_futures=True)
+                    except Exception:
+                        pass
+
+                # Filter out already completed args after a watchdog restart.
+                if pending_args:
+                    pending_args = deque([a for a in pending_args if a[0].name not in completed_instances])
+    except KeyboardInterrupt:
+        import os
+        # Fallback cleanup for stubborn children.
+        os.system("pkill -f 'run-experiments' || true")
+        print("Workers terminated.")
+        sys.exit(1)
+
+    for r in raw_results:
+        if r is None:
+            continue
+        if r[0] == "skip_processed":
+            pass
+        elif r[0] == "skip_status" and verbose:
+            print(f"  Skipped {r[1]}: status {r[2]}")
+        elif r[0] == "error" and verbose:
+            print(f"  Error {r[1]}: {r[2]}")
+
+    if checkpoint:
+        return list(checkpoint.load_existing_results().values())
+    results = []
+    for r in raw_results:
+        if r is not None and r[0] in ("ok", "ok_infeasible"):
+            results.append(r[1])
+    return results
+
+
+def main():
+    """Main entry point."""
+    args = parse_args()
+
+    dataset_path = PROJECT_ROOT / "RiosSolisDataset" / "Instances" / "Instances"
+
+    if not dataset_path.exists():
+        print(f"Error: Dataset path not found: {dataset_path}")
+        return
+
+    tmp_dir = PROJECT_ROOT / "tmp"
+    mc_tmp_dir = tmp_dir / "monte_carlo"
+    default_checkpoint_path = (
+        mc_tmp_dir / "experiment_results_checkpoint.jsonl"
+        if args.mc_income
+        else tmp_dir / "experiment_results_checkpoint.jsonl"
+    )
+    default_timeout_log_path = (
+        mc_tmp_dir / "timeout_instances.csv"
+        if args.mc_income
+        else tmp_dir / "timeout_instances.csv"
+    )
+    checkpoint_path = args.checkpoint or default_checkpoint_path
+    timeout_log_path = args.timeout_log or default_timeout_log_path
+    timelines_dir = args.timelines_dir or (tmp_dir / "timelines")
+    initial_solver_name, enable_solver_fallback = resolve_solver_strategy(args.scip)
+
+    # Handle --summary mode
+    if args.summary:
+        print("=" * 60)
+        print("RPML EXPERIMENT RESULTS SUMMARY")
+        print("=" * 60)
+        print(f"\nLoading results from: {checkpoint_path}\n")
+        
+        checkpoint = CheckpointManager(checkpoint_path)
+        results = list(checkpoint.load_existing_results().values())
+        
+        if not results:
+            print("No results found in checkpoint.")
+            return
+        
+        print_summary(results)
+        
+        csv_path = tmp_dir / "experiment_results.csv"
+        checkpoint.export_to_csv(csv_path)
+        if results:
+            print(f"\nResults exported to: {csv_path}")
+        return
+
+    print("=" * 60)
+    print("RPML EXPERIMENTS")
+    print("=" * 60)
+    print("\nRunning experiments on Rios-Solis dataset...")
+    print("Comparing optimal MILP with Debt Avalanche and Debt Snowball baselines.")
+    print(f"\nParameters:")
+    print(f"  Max instances per group: {args.max_instances or 'all'}")
+    print(f"  Loan counts: {args.n_loans}")
+    print(f"  Time limit: {args.time_limit}s")
+    print(f"  Watchdog timeout: {args.time_limit + args.watchdog_grace_seconds}s")
+    print(f"  Initial solver: {initial_solver_name}")
+    print(f"  HiGHS->SCIP fallback: {'enabled' if enable_solver_fallback else 'disabled'}")
+    print(f"  Multiprocessing: {'enabled' if args.parallel else 'disabled'}")
+    if args.parallel:
+        print(f"  Workers: {args.workers or 'auto (CPU count)'}")
+    print(f"  Checkpoint: {checkpoint_path}")
+    print(f"  Timeout log: {timeout_log_path}")
+    print(f"  Export timelines: {'yes' if args.export_timelines else 'no'}")
+    if args.export_timelines:
+        print(f"  Timelines dir: {timelines_dir}")
+    print(f"  Monte Carlo income mode: {'yes' if args.mc_income else 'no'}")
+    if args.mc_income:
+        print(f"  MC scenarios: {args.mc_scenarios}")
+        print(f"  MC seed: {args.mc_seed}")
+        print(f"  MC rho: {args.mc_rho}")
+        print(f"  MC sigma: {args.mc_sigma}")
+        print(f"  MC shock prob: {args.mc_shock_prob}")
+        print(f"  MC shock severity: {args.mc_shock_severity}")
+    print(f"  Skip known timeouts: {'no' if args.include_known_timeouts else 'yes'}")
+    if args.restart:
+        print("  Restart: yes (ignoring existing checkpoint)")
+    print()
+
+    if args.mc_income:
+        mc_output_path = args.mc_output or (mc_tmp_dir / "mc_income_results.csv")
+        mc_config = IncomeMCConfig(
+            n_scenarios=args.mc_scenarios,
+            seed=args.mc_seed,
+            rho=args.mc_rho,
+            sigma=args.mc_sigma,
+            shock_prob=args.mc_shock_prob,
+            shock_severity_mean=args.mc_shock_severity,
+            shock_severity_std=max(args.mc_shock_severity * 0.25, 0.01),
+            min_income_floor=1.0,
+        )
+        mc_config.validate()
+
+        if args.parallel:
+            aggregates, scenario_rows, scenario_comparisons = run_monte_carlo_experiments_parallel(
+                dataset_path=dataset_path,
+                mc_config=mc_config,
+                max_instances_per_group=args.max_instances,
+                time_limit_seconds=args.time_limit,
+                verbose=True,
+                allowed_n_loans=tuple(args.n_loans),
+                solver_name=initial_solver_name,
+                n_workers=args.workers,
+                checkpoint_path=checkpoint_path,
+                restart=args.restart,
+            )
+        else:
+            aggregates, scenario_rows, scenario_comparisons = run_monte_carlo_experiments(
+                dataset_path=dataset_path,
+                mc_config=mc_config,
+                max_instances_per_group=args.max_instances,
+                time_limit_seconds=args.time_limit,
+                verbose=True,
+                allowed_n_loans=tuple(args.n_loans),
+                solver_name=initial_solver_name,
+                checkpoint_path=checkpoint_path,
+                restart=args.restart,
+            )
+        instance_csv, scenario_csv, metadata_json = _write_mc_outputs(
+            output_path=mc_output_path,
+            aggregates=aggregates,
+            scenario_rows=scenario_rows,
+            config=mc_config,
+        )
+
+        print("\n" + "=" * 60)
+        print("MONTE CARLO INCOME SUMMARY")
+        print("=" * 60)
+        print(f"Instances processed: {len(aggregates)}")
+        if aggregates:
+            avg_infeasible = float(np.mean([r.infeasible_rate for r in aggregates]))
+            avg_cost = float(np.mean([r.mean_cost for r in aggregates if np.isfinite(r.mean_cost)]))
+            print(f"Average infeasible rate: {avg_infeasible:.3f}")
+            if np.isfinite(avg_cost):
+                print(f"Average mean cost: {avg_cost:,.2f}")
+        print(f"MC aggregate CSV: {instance_csv}")
+        print(f"MC scenario CSV: {scenario_csv}")
+        print(f"MC metadata JSON: {metadata_json}")
+        if scenario_comparisons:
+            print("\n" + "=" * 60)
+            print("MONTE CARLO BASELINE COMPARISON SUMMARY")
+            print_summary(scenario_comparisons)
+        return
+
+    if args.parallel:
+        results = run_experiments_parallel(
+            dataset_path=dataset_path,
+            max_instances_per_group=args.max_instances,
+            time_limit_seconds=args.time_limit,
+            watchdog_grace_seconds=args.watchdog_grace_seconds,
+            verbose=True,
+            allowed_n_loans=tuple(args.n_loans),
+            n_workers=args.workers,
+            checkpoint_path=checkpoint_path,
+            timeout_log_path=timeout_log_path,
+            skip_known_timeouts=not args.include_known_timeouts,
+            restart=args.restart,
+            initial_solver_name=initial_solver_name,
+            enable_solver_fallback=enable_solver_fallback,
+            export_timelines=args.export_timelines,
+            timelines_dir=timelines_dir,
+        )
+    else:
+        results = run_experiments(
+            dataset_path=dataset_path,
+            max_instances_per_group=args.max_instances,
+            time_limit_seconds=args.time_limit,
+            verbose=True,
+            allowed_n_loans=tuple(args.n_loans),
+            checkpoint_path=checkpoint_path,
+            timeout_log_path=timeout_log_path,
+            skip_known_timeouts=not args.include_known_timeouts,
+            restart=args.restart,
+            solver_name=initial_solver_name,
+            export_timelines=args.export_timelines,
+            timelines_dir=timelines_dir,
+        )
+
+    print("\n" + "=" * 60)
+    print_summary(results)
+
+    checkpoint = CheckpointManager(checkpoint_path)
+    csv_path = tmp_dir / "experiment_results.csv"
+    checkpoint.export_to_csv(csv_path)
+    if checkpoint.load_existing_results():
+        print(f"\nResults exported to: {csv_path}")
+    if timeout_log_path.exists():
+        print(f"Timeout instances logged to: {timeout_log_path}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nInterrupted by user. Exiting...")
+        import os
+        os.system("pkill -f 'run-experiments' || true")
+        import sys
+        sys.exit(1)
