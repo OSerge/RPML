@@ -14,5 +14,10 @@ class RpmlAdapter:
         instance: RiosSolisInstance,
         *,
         time_limit_seconds: int | None = 60,
+        ru_mode: bool = True,
     ) -> RPMLSolution:
-        return solve_rpml(instance, time_limit_seconds=time_limit_seconds)
+        return solve_rpml(
+            instance,
+            time_limit_seconds=time_limit_seconds,
+            ru_mode=ru_mode,
+        )

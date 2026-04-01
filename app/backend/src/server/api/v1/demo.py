@@ -9,7 +9,18 @@ from server.services.demo_seed import DemoSeedValidationError, seed_demo_scenari
 router = APIRouter()
 
 
-@router.post("/seed")
+@router.post(
+    "/seed",
+    summary="Заполнить демо-данные",
+    description=(
+        "Идемпотентно создает/обновляет демо-сценарий и связанные данные для текущего пользователя, "
+        "чтобы можно было сразу запускать оптимизацию."
+    ),
+    responses={
+        401: {"description": "Пользователь не аутентифицирован."},
+        422: {"description": "Ошибка валидации демо-данных."},
+    },
+)
 def post_demo_seed(
     db: Session = Depends(get_db),
     current_user: UserRead = Depends(get_current_user),

@@ -20,3 +20,6 @@ class OptimizationPlanORM(Base):
     solver_status: Mapped[str] = mapped_column(String(32), nullable=False)
     input_mode: Mapped[str] = mapped_column(String(64), nullable=False, default="scenario_snapshot")
     assumptions: Mapped[list] = mapped_column(JSON, nullable=False)
+    ru_mode: Mapped[bool] = mapped_column(default=True, nullable=False)
+    mc_income: Mapped[bool] = mapped_column(default=False, nullable=False)
+    mc_summary: Mapped[dict | list | None] = mapped_column(JSON, nullable=True)

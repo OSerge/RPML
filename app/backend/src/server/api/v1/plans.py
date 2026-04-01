@@ -15,16 +15,32 @@ router = APIRouter()
 
 
 class OptimizationPlanResponse(BaseModel):
-    status: str
-    total_cost: float
-    payments_matrix: list[list[float]]
+    status: str = Field(description="Статус решения (OPTIMAL/FEASIBLE/...).")
+    total_cost: float = Field(description="Стоимость базового детерминированного плана.")
+    payments_matrix: list[list[float]] = Field(description="Матрица платежей [loan][month].")
     input_mode: str = MVP_INPUT_MODE
-    assumptions: list[str] = Field(default_factory=lambda: list(MVP_ASSUMPTIONS))
+    assumptions: list[str] = Field(
+        default_factory=lambda: list(MVP_ASSUMPTIONS),
+        description="Список допущений, использованных при расчете.",
+    )
+    ru_mode: bool = Field(description="Фактически использованный RU-режим.")
+    mc_income: bool = Field(description="Флаг MC-режима для данного плана.")
+    mc_summary: dict | None = Field(
+        default=None,
+        description="Агрегаты Monte Carlo, если расчет выполнялся с `mc_income=true`.",
+    )
 
 
 @router.get(
     "/plans/{plan_id}",
     response_model=OptimizationPlanResponse,
+    summary="Получить асинхронный план по ID",
+    description="Возвращает результат расчета, ранее завершенного через `/optimization/tasks`.",
+    responses={
+        401: {"description": "Пользователь не аутентифицирован."},
+        404: {"$ref": "#/components/responses/ErrorContent"},
+        422: {"$ref": "#/components/responses/ErrorContent"},
+    },
 )
 def get_optimization_plan(
     plan_id: str,
@@ -40,4 +56,7 @@ def get_optimization_plan(
         payments_matrix=result.payments_matrix,
         input_mode=result.input_mode,
         assumptions=result.assumptions,
+        ru_mode=result.ru_mode,
+        mc_income=result.mc_income,
+        mc_summary=result.mc_summary,
     )

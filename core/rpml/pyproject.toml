@@ -21,3 +21,8 @@ run-experiments = "rpml.cli:main"
 [build-system]
 requires = ["uv_build>=0.9.11,<0.10"]
 build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "ipywidgets>=8.1.8",
+]

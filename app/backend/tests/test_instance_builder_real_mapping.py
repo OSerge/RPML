@@ -108,12 +108,12 @@ def test_profile_horizon_mismatch_with_income_vector_raises() -> None:
         build_rios_solis_instance(debts, profile, horizon_months=3, user_id=1)
 
 
-def test_source_json_vector_length_mismatch_raises() -> None:
+def test_source_json_vector_length_mismatch_is_ignored_for_solver_instance() -> None:
     debts, profile = _profile_and_debts(principals=(1.0, 2.0))
     assert profile.source_json is not None
     profile.source_json["principals"] = [1.0]
-    with pytest.raises(OptimizationInstanceError, match="principals"):
-        build_rios_solis_instance(debts, profile, horizon_months=3, user_id=1)
+    inst = build_rios_solis_instance(debts, profile, horizon_months=3, user_id=1)
+    np.testing.assert_array_equal(inst.principals, np.array([1.0, 2.0]))
 
 
 def test_non_canonical_debt_order_raises() -> None:

@@ -9,17 +9,6 @@ from server.domain.models.loan_type import LoanType, parse_loan_type
 from server.infrastructure.db.models.debt import DebtORM
 from server.infrastructure.db.models.scenario_profile import ScenarioProfileORM
 
-_PER_LOAN_SOURCE_KEYS = (
-    "principals",
-    "fixedPayment",
-    "minPaymentPct",
-    "prepayPenalty",
-    "stipulatedAmount",
-    "loanTypes",
-    "releaseTimeByLoan",
-)
-
-
 class OptimizationInstanceError(ValueError):
     """Raised when debts and scenario profile cannot be mapped to RiosSolisInstance."""
 
@@ -82,7 +71,6 @@ def _require_non_null_fields(debt: DebtORM) -> None:
 def _validate_profile_vectors(
     profile: ScenarioProfileORM,
     *,
-    n_loans: int,
     horizon_months: int,
 ) -> None:
     income = profile.monthly_income_vector
@@ -97,25 +85,6 @@ def _validate_profile_vectors(
             f"scenario profile horizon_months ({profile.horizon_months}) does not match "
             f"monthly_income_vector length ({len(income)})"
         )
-
-    if profile.source_json is None:
-        raise OptimizationInstanceError("scenario profile source_json is required for optimization")
-    if not isinstance(profile.source_json, dict):
-        raise OptimizationInstanceError("scenario profile source_json must be an object")
-
-    for key in _PER_LOAN_SOURCE_KEYS:
-        if key not in profile.source_json:
-            raise OptimizationInstanceError(
-                f"scenario profile source_json is missing key {key!r}"
-            )
-        vec = profile.source_json[key]
-        if not isinstance(vec, list):
-            raise OptimizationInstanceError(f"scenario profile source_json[{key!r}] must be a list")
-        if len(vec) != n_loans:
-            raise OptimizationInstanceError(
-                f"scenario profile source_json[{key!r}] length ({len(vec)}) does not match "
-                f"number of debts ({n_loans})"
-            )
 
 
 def build_rios_solis_instance(
@@ -135,7 +104,7 @@ def build_rios_solis_instance(
     for d in ordered:
         _require_non_null_fields(d)
 
-    _validate_profile_vectors(profile, n_loans=n, horizon_months=t)
+    _validate_profile_vectors(profile, horizon_months=t)
 
     n_cars, n_houses, n_credit_cards, n_bank_loans = _count_loan_types(ordered)
 

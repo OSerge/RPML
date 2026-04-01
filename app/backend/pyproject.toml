@@ -33,9 +33,15 @@ dev = [
     "pytest>=7.0.0",
     "httpx>=0.24.0",
     "pyyaml>=6.0.0",
+    "gradio>=5.0.0",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
+
+[dependency-groups]
+dev = [
+    "gradio>=6.10.0",
+]

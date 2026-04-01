@@ -22,12 +22,17 @@ from server.infrastructure.db.models.optimization_task import OptimizationTaskOR
 class CreateAsyncTaskResult:
     task_id: str
     status: str = "pending"
+    ru_mode: bool = True
+    mc_income: bool = False
 
 
 def execute_create_async_optimization_task(
     db: Session,
     user_id: int,
     horizon_months: int,
+    *,
+    ru_mode: bool = True,
+    mc_income: bool = False,
 ) -> CreateAsyncTaskResult:
     task_id = str(uuid.uuid4())
     row = OptimizationTaskORM(
@@ -35,6 +40,8 @@ def execute_create_async_optimization_task(
         user_id=user_id,
         status="pending",
         horizon_months=horizon_months,
+        ru_mode=ru_mode,
+        mc_income=mc_income,
         plan_id=None,
         error_message=None,
     )
@@ -43,7 +50,11 @@ def execute_create_async_optimization_task(
     from server.infrastructure.queue.tasks import run_optimization_task
 
     run_optimization_task.apply_async(args=(), task_id=task_id)
-    return CreateAsyncTaskResult(task_id=task_id)
+    return CreateAsyncTaskResult(
+        task_id=task_id,
+        ru_mode=ru_mode,
+        mc_income=mc_income,
+    )
 
 
 @dataclass(frozen=True)
@@ -52,6 +63,8 @@ class TaskStatusResult:
     task_id: str
     plan_id: str | None
     error: str | None
+    ru_mode: bool
+    mc_income: bool
 
 
 def execute_get_optimization_task_status(
@@ -68,6 +81,8 @@ def execute_get_optimization_task_status(
         task_id=row.celery_task_id,
         plan_id=row.plan_id,
         error=err,
+        ru_mode=bool(row.ru_mode),
+        mc_income=bool(row.mc_income),
     )
 
 
@@ -79,6 +94,9 @@ def _persist_completed_plan(
     total_cost: float,
     payments_matrix: list[list[float]],
     solver_status: str,
+    ru_mode: bool,
+    mc_income: bool,
+    mc_summary: dict | None,
 ) -> None:
     plan_id = str(uuid.uuid4())
     plan = OptimizationPlanORM(
@@ -89,6 +107,9 @@ def _persist_completed_plan(
         solver_status=solver_status,
         input_mode=MVP_INPUT_MODE,
         assumptions=list(MVP_ASSUMPTIONS),
+        ru_mode=ru_mode,
+        mc_income=mc_income,
+        mc_summary=mc_summary,
     )
     db.add(plan)
     task = db.get(OptimizationTaskORM, task_id)
@@ -123,8 +144,17 @@ def run_optimization_job_for_task_id(task_id: str) -> None:
             return
         user_id = task.user_id
         horizon = task.horizon_months
+        ru_mode = bool(task.ru_mode)
+        mc_income = bool(task.mc_income)
         try:
-            result = execute_run_optimization_sync(db, user_id, horizon, mode="async")
+            result = execute_run_optimization_sync(
+                db,
+                user_id,
+                horizon,
+                mode="async",
+                ru_mode=ru_mode,
+                mc_income=mc_income,
+            )
         except OptimizationInstanceError as exc:
             _persist_failed(db, task_id=task_id, message=str(exc))
             return
@@ -142,6 +172,9 @@ def run_optimization_job_for_task_id(task_id: str) -> None:
             total_cost=result.total_cost,
             payments_matrix=result.payments_matrix,
             solver_status=result.solver_status,
+            ru_mode=result.ru_mode,
+            mc_income=result.mc_income,
+            mc_summary=result.mc_summary,
         )
     finally:
         db.close()
