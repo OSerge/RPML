@@ -45,6 +45,10 @@ class OptimizationRunResponse(BaseModel):
     total_cost: float = Field(description="Стоимость базового детерминированного плана.")
     payments_matrix: list[list[float]] = Field(description="Матрица платежей [loan][month].")
     balances_matrix: list[list[float]] = Field(description="Матрица остатков [loan][month].")
+    savings_vector: list[float] = Field(
+        default_factory=list,
+        description="Расчетный остаток доступного бюджета по месяцам для данного плана (непотраченные средства, перенесенные вперед).",
+    )
     horizon_months: int = Field(description="Использованный горизонт планирования.")
     baseline_comparison: dict = Field(
         description="Сравнение MILP-плана с baseline-стратегиями (avalanche/snowball)."
@@ -61,6 +65,16 @@ class OptimizationRunResponse(BaseModel):
         description=(
             "Агрегаты Monte Carlo по стоимости и времени решения "
             "(mean/median/p90, доля infeasible и т.д.)."
+        ),
+    )
+    budget_policy: str = Field(
+        description="Политика применения месячного бюджета в модели.",
+    )
+    budget_trace: list[dict] = Field(
+        default_factory=list,
+        description=(
+            "Помесячная трассировка бюджета: доход месяца, перенос, доступный бюджет, "
+            "фактические платежи и остаток переноса."
         ),
     )
 
@@ -153,11 +167,14 @@ def run_optimization_sync(
         total_cost=result.total_cost,
         payments_matrix=result.payments_matrix,
         balances_matrix=result.balances_matrix,
+        savings_vector=result.savings_vector,
         horizon_months=result.horizon_months,
         baseline_comparison=result.baseline_comparison,
         ru_mode=result.ru_mode,
         mc_income=result.mc_income,
         mc_summary=result.mc_summary,
+        budget_policy=result.budget_policy,
+        budget_trace=result.budget_trace,
     )
 
 

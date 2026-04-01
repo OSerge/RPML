@@ -22,6 +22,9 @@ dependencies = [
     "matplotlib>=3.10.8",
 ]
 
+[project.scripts]
+gradio-api-tester = "server.gradio_api_tester:main"
+
 [tool.uv.sources]
 rpml = { workspace = true }
 

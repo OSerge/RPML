@@ -1,6 +1,12 @@
 """RPML: Repayment Planning for Multiple Loans optimization package."""
 
-from .data_loader import RiosSolisInstance, load_instance, load_all_instances, get_instances_by_size
+from .data_loader import (
+    RiosSolisInstance,
+    load_instance,
+    load_all_instances,
+    get_instances_by_size,
+    with_budget_starts_next_month,
+)
 from .milp_model import solve_rpml, RPMLSolution
 from .baseline import BaselineSolution, debt_avalanche, debt_snowball, debt_average
 from .metrics import (
@@ -24,6 +30,7 @@ __all__ = [
     "load_instance",
     "load_all_instances",
     "get_instances_by_size",
+    "with_budget_starts_next_month",
     "solve_rpml",
     "RPMLSolution",
     "BaselineSolution",

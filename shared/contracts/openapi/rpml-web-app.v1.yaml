@@ -250,6 +250,80 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/scenario/profile:
+    get:
+      tags:
+      - scenario
+      summary: Получить активный профиль дохода
+      description: Возвращает текущий сценарный профиль дохода пользователя (последний
+        по времени).
+      operationId: get_profile_api_v1_scenario_profile_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScenarioProfileResponse'
+        '401':
+          description: Пользователь не аутентифицирован.
+        '404':
+          description: Профиль не найден.
+      security:
+      - HTTPBearer: []
+    put:
+      tags:
+      - scenario
+      summary: Обновить профиль дохода
+      description: Обновляет вектор доступного бюджета. Если профиль отсутствует,
+        создается новый.
+      operationId: upsert_profile_api_v1_scenario_profile_put
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ScenarioProfileUpdateRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScenarioProfileResponse'
+        '401':
+          description: Пользователь не аутентифицирован.
+        '422':
+          description: Ошибка валидации.
+      security:
+      - HTTPBearer: []
+  /api/v1/scenario/profile/estimate-available-budget:
+    post:
+      tags:
+      - scenario
+      summary: Оценить доступный бюджет на погашение
+      description: Рассчитывает доступный бюджет как `(income - mandatory - variable)
+        * (1 - safety_buffer_pct)` и записывает его как равномерный monthly_income_vector.
+      operationId: estimate_available_budget_api_v1_scenario_profile_estimate_available_budget_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AvailableBudgetEstimateRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AvailableBudgetEstimateResponse'
+        '401':
+          description: Пользователь не аутентифицирован.
+        '422':
+          description: Ошибка валидации.
+      security:
+      - HTTPBearer: []
   /api/v1/optimization/run:
     post:
       tags:
@@ -373,6 +447,55 @@ paths:
           description: Unprocessable Content
 components:
   schemas:
+    AvailableBudgetEstimateRequest:
+      properties:
+        horizon_months:
+          type: integer
+          maximum: 240.0
+          minimum: 1.0
+          title: Horizon Months
+          description: Горизонт планирования в месяцах.
+        monthly_income:
+          type: number
+          minimum: 0.0
+          title: Monthly Income
+          description: Средний месячный доход пользователя.
+        mandatory_expenses:
+          type: number
+          minimum: 0.0
+          title: Mandatory Expenses
+          description: Обязательные ежемесячные расходы.
+        variable_expenses:
+          type: number
+          minimum: 0.0
+          title: Variable Expenses
+          description: Прочие переменные ежемесячные расходы.
+          default: 0
+        safety_buffer_pct:
+          type: number
+          maximum: 1.0
+          minimum: 0.0
+          title: Safety Buffer Pct
+          description: Доля защитного буфера (0..1), не направляемая в погашение.
+          default: 0.1
+      type: object
+      required:
+      - horizon_months
+      - monthly_income
+      - mandatory_expenses
+      title: AvailableBudgetEstimateRequest
+    AvailableBudgetEstimateResponse:
+      properties:
+        monthly_available_budget:
+          type: number
+          title: Monthly Available Budget
+        scenario_profile:
+          $ref: '#/components/schemas/ScenarioProfileResponse'
+      type: object
+      required:
+      - monthly_available_budget
+      - scenario_profile
+      title: AvailableBudgetEstimateResponse
     CreateOptimizationTaskRequest:
       properties:
         horizon_months:
@@ -803,6 +926,13 @@ components:
           type: array
           title: Balances Matrix
           description: Матрица остатков [loan][month].
+        savings_vector:
+          items:
+            type: number
+          type: array
+          title: Savings Vector
+          description: Расчетный остаток доступного бюджета по месяцам для данного
+            плана (непотраченные средства, перенесенные вперед).
         horizon_months:
           type: integer
           title: Horizon Months
@@ -839,6 +969,18 @@ components:
           title: Mc Summary
           description: Агрегаты Monte Carlo по стоимости и времени решения (mean/median/p90,
             доля infeasible и т.д.).
+        budget_policy:
+          type: string
+          title: Budget Policy
+          description: Политика применения месячного бюджета в модели.
+        budget_trace:
+          items:
+            additionalProperties: true
+            type: object
+          type: array
+          title: Budget Trace
+          description: 'Помесячная трассировка бюджета: доход месяца, перенос, доступный
+            бюджет, фактические платежи и остаток переноса.'
       type: object
       required:
       - status
@@ -849,6 +991,7 @@ components:
       - baseline_comparison
       - ru_mode
       - mc_income
+      - budget_policy
       title: OptimizationRunResponse
     OptimizationTaskStatusResponse:
       properties:
@@ -890,6 +1033,57 @@ components:
       - ru_mode
       - mc_income
       title: OptimizationTaskStatusResponse
+    ScenarioProfileResponse:
+      properties:
+        id:
+          type: integer
+          title: Id
+        code:
+          type: string
+          title: Code
+        horizon_months:
+          type: integer
+          title: Horizon Months
+        monthly_income_vector:
+          items:
+            type: number
+          type: array
+          title: Monthly Income Vector
+        baseline_reference:
+          anyOf:
+          - additionalProperties: true
+            type: object
+          - items: {}
+            type: array
+          - type: 'null'
+          title: Baseline Reference
+      type: object
+      required:
+      - id
+      - code
+      - horizon_months
+      - monthly_income_vector
+      title: ScenarioProfileResponse
+    ScenarioProfileUpdateRequest:
+      properties:
+        horizon_months:
+          anyOf:
+          - type: integer
+            maximum: 240.0
+            minimum: 1.0
+          - type: 'null'
+          title: Horizon Months
+          description: Горизонт планирования в месяцах.
+        monthly_income_vector:
+          anyOf:
+          - items:
+              type: number
+            type: array
+          - type: 'null'
+          title: Monthly Income Vector
+          description: Вектор доступного бюджета на погашение по месяцам.
+      type: object
+      title: ScenarioProfileUpdateRequest
     TokenResponse:
       properties:
         access_token:
