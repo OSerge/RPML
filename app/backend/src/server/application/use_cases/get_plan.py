@@ -17,6 +17,9 @@ class PlanResult:
     payments_matrix: list[list[float]]
     input_mode: str
     assumptions: list[str]
+    ru_mode: bool
+    mc_income: bool
+    mc_summary: dict | None
 
 
 def execute_get_plan(db: Session, user_id: int, plan_id: str) -> PlanResult | None:
@@ -30,4 +33,7 @@ def execute_get_plan(db: Session, user_id: int, plan_id: str) -> PlanResult | No
         payments_matrix=row.payments_matrix,
         input_mode=row.input_mode or MVP_INPUT_MODE,
         assumptions=[str(x) for x in assumptions],
+        ru_mode=bool(row.ru_mode),
+        mc_income=bool(row.mc_income),
+        mc_summary=row.mc_summary if isinstance(row.mc_summary, dict) else None,
     )

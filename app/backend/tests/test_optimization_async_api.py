@@ -15,7 +15,21 @@ def test_create_async_task_returns_task_id(client, auth_headers, seeded_debts):
     body = res.json()
     assert "task_id" in body
     assert body.get("status") == "pending"
+    assert body.get("ru_mode") is True
+    assert body.get("mc_income") is False
     uuid.UUID(body["task_id"])
+
+
+def test_create_async_task_accepts_mode_flags(client, auth_headers, seeded_debts):
+    res = client.post(
+        "/api/v1/optimization/tasks",
+        headers=auth_headers,
+        json={"horizon_months": 24, "ru_mode": False, "mc_income": True},
+    )
+    assert res.status_code == 202
+    body = res.json()
+    assert body["ru_mode"] is False
+    assert body["mc_income"] is True
 
 
 def test_get_task_status_returns_completed_with_plan_id(client, auth_headers, seeded_debts):
@@ -37,12 +51,14 @@ def test_get_task_status_returns_completed_with_plan_id(client, auth_headers, se
     assert payload["task_id"] == task_id
     assert "plan_id" in payload
     assert payload["plan_id"]
+    assert payload["ru_mode"] is True
+    assert payload["mc_income"] is False
     uuid.UUID(payload["plan_id"])
     assert payload.get("error") in (None, "")
 
 
 def test_get_task_status_failed_shows_error(client, auth_headers, seeded_debts, monkeypatch):
-    def fake_run(self, instance, *, time_limit_seconds=None):
+    def fake_run(self, instance, *, time_limit_seconds=None, ru_mode=True):
         n, t = instance.n, instance.T
         return RPMLSolution(
             payments=np.zeros((n, t)),
@@ -76,6 +92,8 @@ def test_get_task_status_failed_shows_error(client, auth_headers, seeded_debts, 
     body = status_res.json()
     assert body["status"] == "failed"
     assert body["task_id"] == task_id
+    assert body["ru_mode"] is True
+    assert body["mc_income"] is False
     assert body.get("plan_id") in (None, "")
     assert body.get("error")
 

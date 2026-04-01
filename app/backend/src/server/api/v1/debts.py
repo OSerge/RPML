@@ -10,12 +10,25 @@ from server.infrastructure.repositories.debt_repository import DebtRepository
 router = APIRouter()
 
 
-@router.get("/loan-types", response_model=LoanTypeDirectory)
+@router.get(
+    "/loan-types",
+    response_model=LoanTypeDirectory,
+    summary="Справочник типов кредитов",
+    description="Возвращает список допустимых значений `loan_type` для операций создания/обновления долгов.",
+)
 def list_loan_types() -> LoanTypeDirectory:
     return LoanTypeDirectory()
 
 
-@router.get("", response_model=list[DebtRead])
+@router.get(
+    "",
+    response_model=list[DebtRead],
+    summary="Список долгов пользователя",
+    description="Возвращает все долги текущего аутентифицированного пользователя.",
+    responses={
+        401: {"description": "Пользователь не аутентифицирован."},
+    },
+)
 def list_debts(
     db: Session = Depends(get_db),
     current_user: UserRead = Depends(get_current_user),
@@ -25,7 +38,20 @@ def list_debts(
     return [DebtRead.model_validate(r) for r in rows]
 
 
-@router.post("", response_model=DebtRead, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "",
+    response_model=DebtRead,
+    status_code=status.HTTP_201_CREATED,
+    summary="Создать долг",
+    description=(
+        "Создает новый долг для текущего пользователя. "
+        "Для последующего расчета оптимизации должны быть заполнены все числовые параметры долга."
+    ),
+    responses={
+        401: {"description": "Пользователь не аутентифицирован."},
+        422: {"description": "Ошибка валидации тела запроса."},
+    },
+)
 def create_debt(
     body: DebtCreate,
     db: Session = Depends(get_db),
@@ -38,7 +64,16 @@ def create_debt(
     return DebtRead.model_validate(row)
 
 
-@router.get("/{debt_id}", response_model=DebtRead)
+@router.get(
+    "/{debt_id}",
+    response_model=DebtRead,
+    summary="Получить долг по ID",
+    description="Возвращает один долг текущего пользователя по идентификатору.",
+    responses={
+        401: {"description": "Пользователь не аутентифицирован."},
+        404: {"description": "Долг не найден."},
+    },
+)
 def get_debt(
     debt_id: int,
     db: Session = Depends(get_db),
@@ -51,7 +86,20 @@ def get_debt(
     return DebtRead.model_validate(row)
 
 
-@router.patch("/{debt_id}", response_model=DebtRead)
+@router.patch(
+    "/{debt_id}",
+    response_model=DebtRead,
+    summary="Обновить долг",
+    description=(
+        "Частично обновляет поля долга по ID. "
+        "Передаются только поля, которые нужно изменить."
+    ),
+    responses={
+        401: {"description": "Пользователь не аутентифицирован."},
+        404: {"description": "Долг не найден."},
+        422: {"description": "Ошибка валидации тела запроса."},
+    },
+)
 def update_debt(
     debt_id: int,
     body: DebtUpdate,
@@ -71,7 +119,16 @@ def update_debt(
     return DebtRead.model_validate(row)
 
 
-@router.delete("/{debt_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/{debt_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Удалить долг",
+    description="Удаляет долг текущего пользователя по ID.",
+    responses={
+        401: {"description": "Пользователь не аутентифицирован."},
+        404: {"description": "Долг не найден."},
+    },
+)
 def delete_debt(
     debt_id: int,
     db: Session = Depends(get_db),

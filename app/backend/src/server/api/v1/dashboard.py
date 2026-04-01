@@ -39,7 +39,18 @@ def _effective_monthly_required_payment(value: float | None) -> float:
     return amount
 
 
-@router.get("", response_model=DashboardResponse)
+@router.get(
+    "",
+    response_model=DashboardResponse,
+    summary="Данные дашборда",
+    description=(
+        "Возвращает агрегированные KPI, список долгов, актуальный сценарий и "
+        "последний результат оптимизации для текущего пользователя."
+    ),
+    responses={
+        401: {"description": "Пользователь не аутентифицирован."},
+    },
+)
 def get_dashboard(
     db: Session = Depends(get_db),
     current_user: UserRead = Depends(get_current_user),

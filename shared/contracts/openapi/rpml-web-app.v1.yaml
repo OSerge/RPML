@@ -8,7 +8,8 @@ paths:
     get:
       tags:
       - health
-      summary: Health
+      summary: Проверка доступности API
+      description: Технический эндпоинт для liveness-проверок и мониторинга.
       operationId: health_health_get
       responses:
         '200':
@@ -24,7 +25,9 @@ paths:
     post:
       tags:
       - auth
-      summary: Login
+      summary: Вход пользователя
+      description: Проверяет email/пароль и возвращает JWT access token для защищенных
+        эндпоинтов API.
       operationId: login_api_v1_auth_login_post
       requestBody:
         content:
@@ -39,6 +42,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/TokenResponse'
+        '401':
+          description: Неверный email или пароль.
         '422':
           description: Validation Error
           content:
@@ -49,7 +54,9 @@ paths:
     get:
       tags:
       - dashboard
-      summary: Get Dashboard
+      summary: Данные дашборда
+      description: Возвращает агрегированные KPI, список долгов, актуальный сценарий
+        и последний результат оптимизации для текущего пользователя.
       operationId: get_dashboard_api_v1_dashboard_get
       responses:
         '200':
@@ -58,13 +65,17 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/DashboardResponse'
+        '401':
+          description: Пользователь не аутентифицирован.
       security:
       - HTTPBearer: []
   /api/v1/demo/seed:
     post:
       tags:
       - demo
-      summary: Post Demo Seed
+      summary: Заполнить демо-данные
+      description: Идемпотентно создает/обновляет демо-сценарий и связанные данные
+        для текущего пользователя, чтобы можно было сразу запускать оптимизацию.
       operationId: post_demo_seed_api_v1_demo_seed_post
       responses:
         '200':
@@ -75,13 +86,19 @@ paths:
                 additionalProperties: true
                 type: object
                 title: Response Post Demo Seed Api V1 Demo Seed Post
+        '401':
+          description: Пользователь не аутентифицирован.
+        '422':
+          description: Ошибка валидации демо-данных.
       security:
       - HTTPBearer: []
   /api/v1/debts/loan-types:
     get:
       tags:
       - debts
-      summary: List Loan Types
+      summary: Справочник типов кредитов
+      description: Возвращает список допустимых значений `loan_type` для операций
+        создания/обновления долгов.
       operationId: list_loan_types_api_v1_debts_loan_types_get
       responses:
         '200':
@@ -94,7 +111,8 @@ paths:
     get:
       tags:
       - debts
-      summary: List Debts
+      summary: Список долгов пользователя
+      description: Возвращает все долги текущего аутентифицированного пользователя.
       operationId: list_debts_api_v1_debts_get
       responses:
         '200':
@@ -106,12 +124,16 @@ paths:
                   $ref: '#/components/schemas/DebtRead'
                 type: array
                 title: Response List Debts Api V1 Debts Get
+        '401':
+          description: Пользователь не аутентифицирован.
       security:
       - HTTPBearer: []
     post:
       tags:
       - debts
-      summary: Create Debt
+      summary: Создать долг
+      description: Создает новый долг для текущего пользователя. Для последующего
+        расчета оптимизации должны быть заполнены все числовые параметры долга.
       operationId: create_debt_api_v1_debts_post
       requestBody:
         content:
@@ -126,19 +148,18 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/DebtRead'
+        '401':
+          description: Пользователь не аутентифицирован.
         '422':
-          description: Validation Error
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/HTTPValidationError'
+          description: Ошибка валидации тела запроса.
       security:
       - HTTPBearer: []
   /api/v1/debts/{debt_id}:
     get:
       tags:
       - debts
-      summary: Get Debt
+      summary: Получить долг по ID
+      description: Возвращает один долг текущего пользователя по идентификатору.
       operationId: get_debt_api_v1_debts__debt_id__get
       security:
       - HTTPBearer: []
@@ -156,6 +177,10 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/DebtRead'
+        '401':
+          description: Пользователь не аутентифицирован.
+        '404':
+          description: Долг не найден.
         '422':
           description: Validation Error
           content:
@@ -165,7 +190,9 @@ paths:
     patch:
       tags:
       - debts
-      summary: Update Debt
+      summary: Обновить долг
+      description: Частично обновляет поля долга по ID. Передаются только поля, которые
+        нужно изменить.
       operationId: update_debt_api_v1_debts__debt_id__patch
       security:
       - HTTPBearer: []
@@ -189,16 +216,17 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/DebtRead'
+        '401':
+          description: Пользователь не аутентифицирован.
+        '404':
+          description: Долг не найден.
         '422':
-          description: Validation Error
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/HTTPValidationError'
+          description: Ошибка валидации тела запроса.
     delete:
       tags:
       - debts
-      summary: Delete Debt
+      summary: Удалить долг
+      description: Удаляет долг текущего пользователя по ID.
       operationId: delete_debt_api_v1_debts__debt_id__delete
       security:
       - HTTPBearer: []
@@ -212,6 +240,10 @@ paths:
       responses:
         '204':
           description: Successful Response
+        '401':
+          description: Пользователь не аутентифицирован.
+        '404':
+          description: Долг не найден.
         '422':
           description: Validation Error
           content:
@@ -222,7 +254,9 @@ paths:
     post:
       tags:
       - optimization
-      summary: Run Optimization Sync
+      summary: Синхронный запуск оптимизации
+      description: Выполняет оптимизацию в рамках одного HTTP-запроса. Возвращает
+        базовый план и, при `mc_income=true`, дополнительный Monte Carlo summary.
       operationId: run_optimization_sync_api_v1_optimization_run_post
       requestBody:
         content:
@@ -237,19 +271,22 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/OptimizationRunResponse'
+        '400':
+          description: Bad Request
+          $ref: '#/components/responses/ErrorContent'
+        '401':
+          description: Пользователь не аутентифицирован.
         '422':
-          description: Validation Error
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/HTTPValidationError'
+          description: Unprocessable Content
+          $ref: '#/components/responses/ErrorContent'
       security:
       - HTTPBearer: []
   /api/v1/optimization/tasks:
     post:
       tags:
       - optimization
-      summary: Create Optimization Task
+      summary: Создать асинхронную задачу оптимизации
+      description: Ставит расчет в очередь Celery и сразу возвращает task_id.
       operationId: create_optimization_task_api_v1_optimization_tasks_post
       requestBody:
         content:
@@ -264,19 +301,20 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/CreateOptimizationTaskResponse'
+        '401':
+          description: Пользователь не аутентифицирован.
         '422':
-          description: Validation Error
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/HTTPValidationError'
+          description: Unprocessable Content
+          $ref: '#/components/responses/ErrorContent'
       security:
       - HTTPBearer: []
   /api/v1/optimization/tasks/{task_id}:
     get:
       tags:
       - optimization
-      summary: Get Optimization Task Status
+      summary: Статус асинхронной задачи оптимизации
+      description: Возвращает текущий статус задачи. При completed в ответе присутствует
+        `plan_id`, который можно запросить через `/optimization/plans/{plan_id}`.
       operationId: get_optimization_task_status_api_v1_optimization_tasks__task_id__get
       security:
       - HTTPBearer: []
@@ -294,17 +332,20 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/OptimizationTaskStatusResponse'
+        '401':
+          description: Пользователь не аутентифицирован.
+        '404':
+          $ref: '#/components/responses/ErrorContent'
+          description: Not Found
         '422':
-          description: Validation Error
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/HTTPValidationError'
+          $ref: '#/components/responses/ErrorContent'
+          description: Unprocessable Content
   /api/v1/optimization/plans/{plan_id}:
     get:
       tags:
       - optimization
-      summary: Get Optimization Plan
+      summary: Получить асинхронный план по ID
+      description: Возвращает результат расчета, ранее завершенного через `/optimization/tasks`.
       operationId: get_optimization_plan_api_v1_optimization_plans__plan_id__get
       security:
       - HTTPBearer: []
@@ -322,12 +363,14 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/OptimizationPlanResponse'
+        '401':
+          description: Пользователь не аутентифицирован.
+        '404':
+          $ref: '#/components/responses/ErrorContent'
+          description: Not Found
         '422':
-          description: Validation Error
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/HTTPValidationError'
+          $ref: '#/components/responses/ErrorContent'
+          description: Unprocessable Content
 components:
   schemas:
     CreateOptimizationTaskRequest:
@@ -337,6 +380,17 @@ components:
           maximum: 240.0
           minimum: 1.0
           title: Horizon Months
+          description: Горизонт планирования в месяцах.
+        ru_mode:
+          type: boolean
+          title: Ru Mode
+          description: Если true, применяются правила RU-режима.
+          default: true
+        mc_income:
+          type: boolean
+          title: Mc Income
+          description: Если true, в фоне будет рассчитан Monte Carlo summary.
+          default: false
       type: object
       required:
       - horizon_months
@@ -346,14 +400,25 @@ components:
         task_id:
           type: string
           title: Task Id
+          description: Идентификатор асинхронной задачи.
         status:
           type: string
           const: pending
           title: Status
           default: pending
+        ru_mode:
+          type: boolean
+          title: Ru Mode
+          description: RU-режим, зафиксированный в задаче.
+        mc_income:
+          type: boolean
+          title: Mc Income
+          description: MC-режим, зафиксированный в задаче.
       type: object
       required:
       - task_id
+      - ru_mode
+      - mc_income
       title: CreateOptimizationTaskResponse
     DashboardKpis:
       properties:
@@ -416,48 +481,58 @@ components:
           maxLength: 255
           minLength: 1
           title: Name
+          description: Название кредита/долга в пользовательском интерфейсе.
         loan_type:
           $ref: '#/components/schemas/LoanType'
+          description: Тип кредита (влияет на канонический порядок в RPML instance).
         principal:
           anyOf:
           - type: number
           - type: 'null'
           title: Principal
+          description: Текущий остаток основного долга.
         fixed_payment:
           anyOf:
           - type: number
           - type: 'null'
           title: Fixed Payment
+          description: Фиксированный обязательный платеж в месяц.
         min_payment_pct:
           anyOf:
           - type: number
           - type: 'null'
           title: Min Payment Pct
+          description: Минимальный платеж как доля от остатка (0..1).
         prepay_penalty:
           anyOf:
           - type: number
           - type: 'null'
           title: Prepay Penalty
+          description: Штраф за досрочное погашение.
         interest_rate_monthly:
           anyOf:
           - type: number
           - type: 'null'
           title: Interest Rate Monthly
+          description: Процентная ставка в месяц.
         default_rate_monthly:
           anyOf:
           - type: number
           - type: 'null'
           title: Default Rate Monthly
+          description: Ставка штрафа/просрочки в месяц.
         stipulated_amount:
           anyOf:
           - type: number
           - type: 'null'
           title: Stipulated Amount
+          description: Договорная сумма платежа (stated monthly amount).
         release_time:
           anyOf:
           - type: integer
           - type: 'null'
           title: Release Time
+          description: Месяц выдачи кредита (0-indexed).
       type: object
       required:
       - name
@@ -468,56 +543,68 @@ components:
         id:
           type: integer
           title: Id
+          description: Идентификатор записи долга.
         user_id:
           type: integer
           title: User Id
+          description: Владелец долга.
         name:
           type: string
           title: Name
+          description: Название долга.
         loan_type:
           anyOf:
           - $ref: '#/components/schemas/LoanType'
           - type: 'null'
+          description: Тип кредита.
         principal:
           anyOf:
           - type: number
           - type: 'null'
           title: Principal
+          description: Остаток основного долга.
         fixed_payment:
           anyOf:
           - type: number
           - type: 'null'
           title: Fixed Payment
+          description: Фиксированный месячный платеж.
         min_payment_pct:
           anyOf:
           - type: number
           - type: 'null'
           title: Min Payment Pct
+          description: Минимальный платеж в долях.
         prepay_penalty:
           anyOf:
           - type: number
           - type: 'null'
           title: Prepay Penalty
+          description: Штраф за досрочное погашение.
         interest_rate_monthly:
           anyOf:
           - type: number
           - type: 'null'
           title: Interest Rate Monthly
+          description: Процентная ставка в месяц.
         default_rate_monthly:
           anyOf:
           - type: number
           - type: 'null'
           title: Default Rate Monthly
+          description: Ставка штрафа в месяц.
         stipulated_amount:
           anyOf:
           - type: number
           - type: 'null'
           title: Stipulated Amount
+          description: Договорная сумма платежа.
         release_time:
           anyOf:
           - type: integer
           - type: 'null'
           title: Release Time
+          description: Месяц выдачи (0-indexed).
       type: object
       required:
       - id
@@ -533,50 +620,60 @@ components:
             minLength: 1
           - type: 'null'
           title: Name
+          description: Новое название кредита/долга.
         loan_type:
           anyOf:
           - $ref: '#/components/schemas/LoanType'
           - type: 'null'
+          description: Новый тип кредита.
         principal:
           anyOf:
           - type: number
           - type: 'null'
           title: Principal
+          description: Новый остаток долга.
         fixed_payment:
           anyOf:
           - type: number
           - type: 'null'
           title: Fixed Payment
+          description: Новый фиксированный платеж.
         min_payment_pct:
           anyOf:
           - type: number
           - type: 'null'
           title: Min Payment Pct
+          description: Новый min payment в долях.
         prepay_penalty:
           anyOf:
           - type: number
           - type: 'null'
           title: Prepay Penalty
+          description: Новый штраф за досрочное погашение.
         interest_rate_monthly:
           anyOf:
           - type: number
           - type: 'null'
           title: Interest Rate Monthly
+          description: Новая ставка в месяц.
         default_rate_monthly:
           anyOf:
           - type: number
           - type: 'null'
           title: Default Rate Monthly
+          description: Новая штрафная ставка в месяц.
         stipulated_amount:
           anyOf:
           - type: number
           - type: 'null'
           title: Stipulated Amount
+          description: Новая договорная сумма платежа.
         release_time:
           anyOf:
           - type: integer
           - type: 'null'
           title: Release Time
+          description: Новый месяц выдачи (0-indexed).
       type: object
       title: DebtUpdate
     HTTPValidationError:
@@ -603,6 +700,7 @@ components:
             type: string
           type: array
           title: Supported Values
+          description: Список поддерживаемых значений loan_type.
       type: object
       title: LoanTypeDirectory
     OptimizationPlanResponse:
@@ -610,9 +708,11 @@ components:
         status:
           type: string
           title: Status
+          description: Статус решения (OPTIMAL/FEASIBLE/...).
         total_cost:
           type: number
           title: Total Cost
+          description: Стоимость базового детерминированного плана.
         payments_matrix:
           items:
             items:
@@ -620,6 +720,7 @@ components:
             type: array
           type: array
           title: Payments Matrix
+          description: Матрица платежей [loan][month].
         input_mode:
           type: string
           title: Input Mode
@@ -629,11 +730,29 @@ components:
             type: string
           type: array
           title: Assumptions
+          description: Список допущений, использованных при расчете.
+        ru_mode:
+          type: boolean
+          title: Ru Mode
+          description: Фактически использованный RU-режим.
+        mc_income:
+          type: boolean
+          title: Mc Income
+          description: Флаг MC-режима для данного плана.
+        mc_summary:
+          anyOf:
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          title: Mc Summary
+          description: Агрегаты Monte Carlo, если расчет выполнялся с `mc_income=true`.
       type: object
       required:
       - status
       - total_cost
       - payments_matrix
+      - ru_mode
+      - mc_income
       title: OptimizationPlanResponse
     OptimizationRunRequest:
       properties:
@@ -642,6 +761,18 @@ components:
           maximum: 240.0
           minimum: 1.0
           title: Horizon Months
+          description: Горизонт планирования в месяцах.
+        ru_mode:
+          type: boolean
+          title: Ru Mode
+          description: Если true, применяются правила RU-режима по досрочному погашению.
+          default: true
+        mc_income:
+          type: boolean
+          title: Mc Income
+          description: Если true, дополнительно рассчитывается Monte Carlo summary
+            по траекториям дохода.
+          default: false
       type: object
       required:
       - horizon_months
@@ -651,9 +782,11 @@ components:
         status:
           type: string
           title: Status
+          description: Статус решения MILP (например, OPTIMAL/FEASIBLE).
         total_cost:
           type: number
           title: Total Cost
+          description: Стоимость базового детерминированного плана.
         payments_matrix:
           items:
             items:
@@ -661,6 +794,7 @@ components:
             type: array
           type: array
           title: Payments Matrix
+          description: Матрица платежей [loan][month].
         balances_matrix:
           items:
             items:
@@ -668,13 +802,16 @@ components:
             type: array
           type: array
           title: Balances Matrix
+          description: Матрица остатков [loan][month].
         horizon_months:
           type: integer
           title: Horizon Months
+          description: Использованный горизонт планирования.
         baseline_comparison:
           additionalProperties: true
           type: object
           title: Baseline Comparison
+          description: Сравнение MILP-плана с baseline-стратегиями (avalanche/snowball).
         input_mode:
           type: string
           const: scenario_snapshot
@@ -685,6 +822,23 @@ components:
             type: string
           type: array
           title: Assumptions
+          description: Список допущений, использованных при расчете.
+        ru_mode:
+          type: boolean
+          title: Ru Mode
+          description: Фактически использованный RU-режим.
+        mc_income:
+          type: boolean
+          title: Mc Income
+          description: Флаг Monte Carlo режима для этого расчета.
+        mc_summary:
+          anyOf:
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          title: Mc Summary
+          description: Агрегаты Monte Carlo по стоимости и времени решения (mean/median/p90,
+            доля infeasible и т.д.).
       type: object
       required:
       - status
@@ -693,6 +847,8 @@ components:
       - balances_matrix
       - horizon_months
       - baseline_comparison
+      - ru_mode
+      - mc_income
       title: OptimizationRunResponse
     OptimizationTaskStatusResponse:
       properties:
@@ -706,29 +862,44 @@ components:
         task_id:
           type: string
           title: Task Id
+          description: Идентификатор асинхронной задачи.
         plan_id:
           anyOf:
           - type: string
           - type: 'null'
           title: Plan Id
+          description: Идентификатор готового плана (заполняется при completed).
         error:
           anyOf:
           - type: string
           - type: 'null'
           title: Error
+          description: Текст ошибки (заполняется при failed).
+        ru_mode:
+          type: boolean
+          title: Ru Mode
+          description: RU-режим задачи.
+        mc_income:
+          type: boolean
+          title: Mc Income
+          description: MC-режим задачи.
       type: object
       required:
       - status
       - task_id
+      - ru_mode
+      - mc_income
       title: OptimizationTaskStatusResponse
     TokenResponse:
       properties:
         access_token:
           type: string
           title: Access Token
+          description: JWT access token для вызова защищенных эндпоинтов.
         token_type:
           type: string
           title: Token Type
+          description: Тип токена (в текущем API всегда bearer).
           default: bearer
       type: object
       required:
@@ -740,9 +911,11 @@ components:
           type: string
           format: email
           title: Email
+          description: Email пользователя для аутентификации.
         password:
           type: string
           title: Password
+          description: Пароль пользователя в открытом виде (передается только по HTTPS).
       type: object
       required:
       - email

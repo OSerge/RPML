@@ -17,6 +17,8 @@ class OptimizationTaskORM(Base):
     )
     status: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
     horizon_months: Mapped[int] = mapped_column(Integer, nullable=False)
+    ru_mode: Mapped[bool] = mapped_column(default=True, nullable=False)
+    mc_income: Mapped[bool] = mapped_column(default=False, nullable=False)
     plan_id: Mapped[str | None] = mapped_column(
         String(36),
         ForeignKey("optimization_plans.id", ondelete="SET NULL"),

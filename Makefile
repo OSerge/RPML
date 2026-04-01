@@ -69,19 +69,33 @@ init: check-tools env backend-sync frontend-sync contracts infra-up migrate seed
 
 run-backend: ## Start backend API in background (uvicorn)
 	@bash -c 'set -euo pipefail; mkdir -p "$(RUN_DIR)"; \
-	if [[ -f "$(BACKEND_PID)" ]] && kill -0 "$$(cat "$(BACKEND_PID)")" 2>/dev/null; then \
+	existing_pid="$$(ps -eo pid,cmd | awk '\''/\/uvicorn server.main:app --host 0.0.0.0 --port 8000/ && !/bash -c/ && !/awk/ {print $$1; exit}'\'')"; \
+	if [[ -n "$$existing_pid" ]]; then \
+		echo "$$existing_pid" > "$(BACKEND_PID)"; \
+		echo "backend already running (pid=$$existing_pid)"; \
+	elif [[ -f "$(BACKEND_PID)" ]] && kill -0 "$$(cat "$(BACKEND_PID)")" 2>/dev/null; then \
 		echo "backend already running (pid=$$(cat "$(BACKEND_PID)"))"; \
 	else \
-		cd "$(BACKEND_DIR)" && nohup uv --project "$(ROOT_DIR)" run --package rpml-backend uvicorn server.main:app --host 0.0.0.0 --port 8000 > "$(BACKEND_LOG)" 2>&1 & echo $$! > "$(BACKEND_PID)"; \
+		cd "$(BACKEND_DIR)"; \
+		nohup uv --project "$(ROOT_DIR)" run --package rpml-backend uvicorn server.main:app --host 0.0.0.0 --port 8000 > "$(BACKEND_LOG)" 2>&1 & \
+		backend_pid="$$!"; \
+		echo "$$backend_pid" > "$(BACKEND_PID)"; \
 		echo "backend started (pid=$$(cat "$(BACKEND_PID)"))"; \
 	fi'
 
 run-worker: ## Start Celery worker in background
 	@bash -c 'set -euo pipefail; mkdir -p "$(RUN_DIR)"; \
-	if [[ -f "$(WORKER_PID)" ]] && kill -0 "$$(cat "$(WORKER_PID)")" 2>/dev/null; then \
+	existing_pid="$$(ps -eo pid,cmd | awk '\''/\/celery -A server.infrastructure.queue.celery_app:celery_app worker -l info/ && !/bash -c/ && !/awk/ {print $$1; exit}'\'')"; \
+	if [[ -n "$$existing_pid" ]]; then \
+		echo "$$existing_pid" > "$(WORKER_PID)"; \
+		echo "worker already running (pid=$$existing_pid)"; \
+	elif [[ -f "$(WORKER_PID)" ]] && kill -0 "$$(cat "$(WORKER_PID)")" 2>/dev/null; then \
 		echo "worker already running (pid=$$(cat "$(WORKER_PID)"))"; \
 	else \
-		cd "$(BACKEND_DIR)" && nohup uv --project "$(ROOT_DIR)" run --package rpml-backend celery -A server.infrastructure.queue.celery_app:celery_app worker -l info > "$(WORKER_LOG)" 2>&1 & echo $$! > "$(WORKER_PID)"; \
+		cd "$(BACKEND_DIR)"; \
+		nohup uv --project "$(ROOT_DIR)" run --package rpml-backend celery -A server.infrastructure.queue.celery_app:celery_app worker -l info > "$(WORKER_LOG)" 2>&1 & \
+		worker_pid="$$!"; \
+		echo "$$worker_pid" > "$(WORKER_PID)"; \
 		echo "worker started (pid=$$(cat "$(WORKER_PID)"))"; \
 	fi'
 

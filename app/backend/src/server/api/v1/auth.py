@@ -10,7 +10,15 @@ from server.infrastructure.repositories.user_repository import UserRepository
 router = APIRouter()
 
 
-@router.post("/login", response_model=TokenResponse)
+@router.post(
+    "/login",
+    response_model=TokenResponse,
+    summary="Вход пользователя",
+    description="Проверяет email/пароль и возвращает JWT access token для защищенных эндпоинтов API.",
+    responses={
+        401: {"description": "Неверный email или пароль."},
+    },
+)
 def login(body: UserLogin, db: Session = Depends(get_db)) -> TokenResponse:
     repo = UserRepository(db)
     user = repo.get_by_email(body.email)
