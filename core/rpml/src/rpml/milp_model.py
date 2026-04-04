@@ -5,7 +5,7 @@ Implements the model from Rios-Solis et al. (2017) for optimal debt repayment.
 """
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Sequence
 
 import numpy as np
 from ortools.linear_solver import pywraplp
@@ -21,6 +21,31 @@ class RPMLSolution:
     savings: np.ndarray  # shape (T,) - S[t]
     active_loans: np.ndarray  # shape (n, T) - Z[j,t]
     objective_value: float
+    solve_time: float
+    gap: float
+    status: str
+
+
+@dataclass
+class StochasticRPMLSolution:
+    """Solution for stochastic RPML with CVaR risk objective."""
+
+    payments: np.ndarray  # shape (n, T)
+    balances: np.ndarray  # shape (n, T)
+    active_loans: np.ndarray  # shape (n, T)
+    scenario_savings: np.ndarray  # shape (n_scenarios, T)
+    scenario_shortfalls: np.ndarray  # shape (n_scenarios, T)
+    scenario_total_shortfalls: np.ndarray  # shape (n_scenarios,)
+    scenario_shortfall_events: np.ndarray  # shape (n_scenarios,)
+    objective_value: float
+    total_payment_cost: float
+    cvar_shortfall: float
+    expected_shortfall: float
+    cash_shortfall_rate: float
+    risk_alpha: float
+    risk_lambda: float
+    shortfall_epsilon: float
+    shortfall_rate_beta: Optional[float]
     solve_time: float
     gap: float
     status: str
@@ -431,4 +456,505 @@ def solve_rpml(
         ru_mode=ru_mode,
     )
     return model.solve()
+
+
+class StochasticRPMLModel:
+    """
+    Stochastic RPML with shared payment plan and CVaR on scenario shortfalls.
+
+    Shared variables are debt-related and common across scenarios.
+    Scenario-specific variables model liquidity paths under scenario incomes.
+    """
+
+    def __init__(
+        self,
+        instance: RiosSolisInstance,
+        scenario_incomes: np.ndarray,
+        risk_alpha: float = 0.95,
+        risk_lambda: float = 1.0,
+        shortfall_epsilon: float = 1e-6,
+        shortfall_rate_beta: Optional[float] = None,
+        time_limit_seconds: Optional[int] = None,
+        solver_name: str = DEFAULT_SOLVER,
+        ru_mode: bool = False,
+    ):
+        self.instance = with_ru_prepayment_rules(instance) if ru_mode else instance
+        self.time_limit = time_limit_seconds
+        self.solver_name = solver_name.upper()
+        self.risk_alpha = float(risk_alpha)
+        self.risk_lambda = float(risk_lambda)
+        self.shortfall_epsilon = float(shortfall_epsilon)
+        self.shortfall_rate_beta = (
+            None if shortfall_rate_beta is None else float(shortfall_rate_beta)
+        )
+        self.scenario_incomes = np.asarray(scenario_incomes, dtype=float)
+
+        if self.scenario_incomes.ndim != 2:
+            raise ValueError("scenario_incomes must be a 2D array of shape (n_scenarios, T)")
+        if self.scenario_incomes.shape[1] != self.instance.T:
+            raise ValueError(
+                f"scenario_incomes shape mismatch: expected second dimension {self.instance.T}, "
+                f"got {self.scenario_incomes.shape[1]}"
+            )
+        if self.scenario_incomes.shape[0] < 1:
+            raise ValueError("scenario_incomes must contain at least one scenario")
+        if not (0.0 < self.risk_alpha < 1.0):
+            raise ValueError("risk_alpha must be in (0, 1)")
+        if self.risk_lambda < 0.0:
+            raise ValueError("risk_lambda must be >= 0")
+        if self.shortfall_epsilon < 0.0:
+            raise ValueError("shortfall_epsilon must be >= 0")
+        if self.shortfall_rate_beta is not None and not (0.0 <= self.shortfall_rate_beta <= 1.0):
+            raise ValueError("shortfall_rate_beta must be in [0, 1]")
+
+        self.n_scenarios = self.scenario_incomes.shape[0]
+
+        self.M = 1e7
+        self.M_j = []
+        for j in range(self.instance.n):
+            max_rate = float(np.max(self.instance.interest_rates[j]))
+            m_val = float(self.instance.principals[j]) * (1.0 + max_rate) ** self.instance.T
+            self.M_j.append(max(1e6, min(1e9, m_val * 2.0)))
+        self.monthly_shortfall_big_m = max(1.0, float(sum(self.M_j)))
+
+        self.solver = pywraplp.Solver.CreateSolver(self.solver_name)
+        if self.solver is None:
+            raise RuntimeError(f"{self.solver_name} solver not available in OR-Tools build.")
+        if hasattr(self.solver, "SuppressOutput"):
+            self.solver.SuppressOutput()
+        if time_limit_seconds is not None:
+            self.solver.SetTimeLimit(time_limit_seconds * 1000)
+
+        if self.solver_name == "SCIP":
+            self.solver.SetSolverSpecificParametersAsString("limits/gap = 0.01")
+        elif self.solver_name == "HIGHS":
+            self.solver.SetSolverSpecificParametersAsString("mip_rel_gap=0.01\noutput_flag=false")
+        else:
+            self.solver.SetSolverSpecificParametersAsString("mip_rel_gap=0.01")
+
+        self.X = None
+        self.B = None
+        self.Z = None
+        self.C = None
+        self.P = None
+        self.Y = None
+        self.S = None
+        self.shortfall = None
+        self.scenario_shortfall = None
+        self.excess = None
+        self.eta = None
+        self.shortfall_event = None
+
+    def _credit_card_range(self) -> range:
+        start = self.instance.n_cars + self.instance.n_houses
+        stop = start + self.instance.n_credit_cards
+        return range(start, stop)
+
+    def _is_credit_card(self, loan_idx: int) -> bool:
+        return loan_idx in self._credit_card_range()
+
+    def build_model(self) -> None:
+        n = self.instance.n
+        T = self.instance.T
+        n_scenarios = self.n_scenarios
+
+        self.X = {}
+        self.B = {}
+        self.Z = {}
+        self.C = {}
+        self.P = {}
+        self.Y = {}
+        self.S = {}
+        self.shortfall = {}
+        self.scenario_shortfall = {}
+        self.excess = {}
+        self.shortfall_event = {}
+
+        for j in range(n):
+            for t in range(T):
+                self.X[j, t] = self.solver.NumVar(0, self.solver.infinity(), f"X_{j}_{t}")
+                self.B[j, t] = self.solver.NumVar(0, self.solver.infinity(), f"B_{j}_{t}")
+                self.Z[j, t] = self.solver.IntVar(0, 1, f"Z_{j}_{t}")
+                self.C[j, t] = self.solver.NumVar(0, self.solver.infinity(), f"C_{j}_{t}")
+                self.P[j, t] = self.solver.NumVar(0, self.solver.infinity(), f"P_{j}_{t}")
+                self.Y[j, t] = self.solver.IntVar(0, 1, f"Y_{j}_{t}")
+
+        for s in range(n_scenarios):
+            for t in range(T):
+                self.S[s, t] = self.solver.NumVar(0, self.solver.infinity(), f"S_{s}_{t}")
+                self.shortfall[s, t] = self.solver.NumVar(0, self.solver.infinity(), f"SF_{s}_{t}")
+            self.scenario_shortfall[s] = self.solver.NumVar(
+                0, self.solver.infinity(), f"SCENARIO_SF_{s}"
+            )
+            self.excess[s] = self.solver.NumVar(0, self.solver.infinity(), f"EXCESS_{s}")
+            self.shortfall_event[s] = self.solver.IntVar(0, 1, f"SHORTFALL_EVENT_{s}")
+
+        self.eta = self.solver.NumVar(0, self.solver.infinity(), "ETA")
+
+        objective = self.solver.Objective()
+        for j in range(n):
+            for t in range(T):
+                objective.SetCoefficient(self.X[j, t], 1.0)
+
+        if self.risk_lambda > 0:
+            objective.SetCoefficient(self.eta, self.risk_lambda)
+            tail_scale = self.risk_lambda / ((1.0 - self.risk_alpha) * n_scenarios)
+            for s in range(n_scenarios):
+                objective.SetCoefficient(self.excess[s], tail_scale)
+
+        objective.SetMinimization()
+
+        for s in range(n_scenarios):
+            budget_0 = self.solver.Constraint(
+                -self.solver.infinity(), float(self.scenario_incomes[s, 0])
+            )
+            for j in range(n):
+                budget_0.SetCoefficient(self.X[j, 0], 1.0)
+            budget_0.SetCoefficient(self.S[s, 0], 1.0)
+            budget_0.SetCoefficient(self.shortfall[s, 0], -1.0)
+
+            for t in range(1, T):
+                budget = self.solver.Constraint(
+                    -self.solver.infinity(), float(self.scenario_incomes[s, t])
+                )
+                for j in range(n):
+                    budget.SetCoefficient(self.X[j, t], 1.0)
+                budget.SetCoefficient(self.S[s, t], 1.0)
+                budget.SetCoefficient(self.S[s, t - 1], -1.0)
+                budget.SetCoefficient(self.shortfall[s, t], -1.0)
+
+            scenario_sum = self.solver.Constraint(0, 0)
+            scenario_sum.SetCoefficient(self.scenario_shortfall[s], 1.0)
+            for t in range(T):
+                scenario_sum.SetCoefficient(self.shortfall[s, t], -1.0)
+
+            excess_ct = self.solver.Constraint(0, self.solver.infinity())
+            excess_ct.SetCoefficient(self.excess[s], 1.0)
+            excess_ct.SetCoefficient(self.scenario_shortfall[s], -1.0)
+            excess_ct.SetCoefficient(self.eta, 1.0)
+
+            for t in range(T):
+                shortfall_event_ct = self.solver.Constraint(
+                    -self.solver.infinity(),
+                    self.shortfall_epsilon,
+                )
+                shortfall_event_ct.SetCoefficient(self.shortfall[s, t], 1.0)
+                shortfall_event_ct.SetCoefficient(
+                    self.shortfall_event[s],
+                    -self.monthly_shortfall_big_m,
+                )
+
+        if self.shortfall_rate_beta is not None:
+            shortfall_rate_ct = self.solver.Constraint(
+                -self.solver.infinity(),
+                self.shortfall_rate_beta * n_scenarios,
+            )
+            for s in range(n_scenarios):
+                shortfall_rate_ct.SetCoefficient(self.shortfall_event[s], 1.0)
+
+        for j in range(n):
+            r_j = self.instance.release_time[j]
+
+            for t in range(r_j):
+                inactive = self.solver.Constraint(0, 0)
+                inactive.SetCoefficient(self.Z[j, t], 1.0)
+                inactive_balance = self.solver.Constraint(0, 0)
+                inactive_balance.SetCoefficient(self.B[j, t], 1.0)
+                inactive_payment = self.solver.Constraint(0, 0)
+                inactive_payment.SetCoefficient(self.X[j, t], 1.0)
+                inactive_c = self.solver.Constraint(0, 0)
+                inactive_c.SetCoefficient(self.C[j, t], 1.0)
+                inactive_p = self.solver.Constraint(0, 0)
+                inactive_p.SetCoefficient(self.P[j, t], 1.0)
+                inactive_y = self.solver.Constraint(0, 0)
+                inactive_y.SetCoefficient(self.Y[j, t], 1.0)
+
+            init_balance_value = self.instance.principals[j]
+            init_balance = self.solver.Constraint(init_balance_value, init_balance_value)
+            init_balance.SetCoefficient(self.B[j, r_j], 1.0)
+
+            zero_x_release = self.solver.Constraint(0, 0)
+            zero_x_release.SetCoefficient(self.X[j, r_j], 1.0)
+            zero_c_release = self.solver.Constraint(0, 0)
+            zero_c_release.SetCoefficient(self.C[j, r_j], 1.0)
+            zero_p_release = self.solver.Constraint(0, 0)
+            zero_p_release.SetCoefficient(self.P[j, r_j], 1.0)
+            zero_y_release = self.solver.Constraint(0, 0)
+            zero_y_release.SetCoefficient(self.Y[j, r_j], 1.0)
+
+            for t in range(r_j + 1, T):
+                i_jt = self.instance.interest_rates[j, t]
+                balance_eq = self.solver.Constraint(0, 0)
+                balance_eq.SetCoefficient(self.B[j, t], 1.0)
+                balance_eq.SetCoefficient(self.B[j, t - 1], -(1.0 + i_jt))
+                balance_eq.SetCoefficient(self.X[j, t], 1.0)
+                balance_eq.SetCoefficient(self.C[j, t], -1.0)
+                balance_eq.SetCoefficient(self.P[j, t], -1.0)
+
+                max_payment = self.solver.Constraint(-self.solver.infinity(), 0)
+                max_payment.SetCoefficient(self.X[j, t], 1.0)
+                max_payment.SetCoefficient(self.B[j, t - 1], -(1.0 + i_jt))
+
+        for j in range(n):
+            M_j = self.M_j[j]
+            for t in range(T):
+                activity = self.solver.Constraint(-self.solver.infinity(), 0)
+                activity.SetCoefficient(self.B[j, t], 1.0)
+                activity.SetCoefficient(self.Z[j, t], -M_j)
+
+                active_pay = self.solver.Constraint(-self.solver.infinity(), 0)
+                active_pay.SetCoefficient(self.X[j, t], 1.0)
+                active_pay.SetCoefficient(self.Z[j, t], -M_j)
+
+                if t > self.instance.release_time[j]:
+                    begins_with_balance = self.solver.Constraint(-self.solver.infinity(), 0)
+                    begins_with_balance.SetCoefficient(
+                        self.B[j, t - 1], 1.0 + self.instance.interest_rates[j, t]
+                    )
+                    begins_with_balance.SetCoefficient(self.Z[j, t], -M_j)
+
+                if t > self.instance.release_time[j]:
+                    monotone = self.solver.Constraint(0, self.solver.infinity())
+                    monotone.SetCoefficient(self.Z[j, t - 1], 1.0)
+                    monotone.SetCoefficient(self.Z[j, t], -1.0)
+
+        for j in range(n):
+            r_j = self.instance.release_time[j]
+
+            for t in range(r_j + 1, self.instance.T):
+                h_jt = self.instance.default_rates[j, t]
+                penalty_mult = 1.0 + h_jt
+
+                underpayment = self.solver.Constraint(0, self.solver.infinity())
+                underpayment.SetCoefficient(self.C[j, t], 1.0)
+                underpayment.SetCoefficient(self.X[j, t], penalty_mult)
+
+                if self._is_credit_card(j):
+                    min_pct = self.instance.min_payment_pct[j]
+                    i_jt = self.instance.interest_rates[j, t]
+                    underpayment.SetCoefficient(
+                        self.B[j, t - 1], -penalty_mult * min_pct * (1.0 + i_jt)
+                    )
+                else:
+                    contractual_payment = float(self.instance.fixed_payment[j])
+                    if t < self.instance.T - 1:
+                        underpayment.SetCoefficient(
+                            self.Z[j, t + 1], -penalty_mult * contractual_payment
+                        )
+
+        for j in range(n):
+            r_j = self.instance.release_time[j]
+            contractual_payment = float(self.instance.fixed_payment[j])
+            penalty = float(self.instance.prepay_penalty[j])
+
+            for t in range(r_j + 1, self.instance.T):
+                if penalty >= PROHIBITED_VALUE * 0.1:
+                    no_overpay = self.solver.Constraint(-self.solver.infinity(), 0)
+                    no_overpay.SetCoefficient(self.X[j, t], 1.0)
+                    no_overpay.SetCoefficient(self.Z[j, t], -contractual_payment)
+
+                    zero_p = self.solver.Constraint(0, 0)
+                    zero_p.SetCoefficient(self.P[j, t], 1.0)
+                    zero_y = self.solver.Constraint(0, 0)
+                    zero_y.SetCoefficient(self.Y[j, t], 1.0)
+                    continue
+
+                trigger_overpay = self.solver.Constraint(-self.solver.infinity(), 0)
+                trigger_overpay.SetCoefficient(self.X[j, t], 1.0)
+                trigger_overpay.SetCoefficient(self.Z[j, t], -contractual_payment)
+                trigger_overpay.SetCoefficient(self.Y[j, t], -self.M_j[j])
+
+                y_only_when_active = self.solver.Constraint(-self.solver.infinity(), 0)
+                y_only_when_active.SetCoefficient(self.Y[j, t], 1.0)
+                y_only_when_active.SetCoefficient(self.Z[j, t], -1.0)
+
+                prepayment_penalty = self.solver.Constraint(0, 0)
+                prepayment_penalty.SetCoefficient(self.P[j, t], 1.0)
+                prepayment_penalty.SetCoefficient(self.Y[j, t], -penalty)
+
+        for j in range(n):
+            final_balance = self.solver.Constraint(0, 0)
+            final_balance.SetCoefficient(self.B[j, T - 1], 1.0)
+
+        for j in range(n):
+            r_j = int(self.instance.release_time[j])
+            rhs = -float(self.instance.principals[j]) * float(
+                np.prod(1.0 + self.instance.interest_rates[j, r_j + 1 : T])
+            )
+            parity = self.solver.Constraint(rhs, rhs)
+            for t in range(r_j + 1, T):
+                coef = float(np.prod(1.0 + self.instance.interest_rates[j, t + 1 : T]))
+                parity.SetCoefficient(self.X[j, t], -coef)
+                parity.SetCoefficient(self.C[j, t], coef)
+                parity.SetCoefficient(self.P[j, t], coef)
+
+    def solve(self) -> StochasticRPMLSolution:
+        if self.X is None:
+            self.build_model()
+
+        import time
+
+        start_time = time.time()
+        status = self.solver.Solve()
+        solve_time = time.time() - start_time
+
+        n = self.instance.n
+        T = self.instance.T
+        n_scenarios = self.n_scenarios
+        status_map = {
+            pywraplp.Solver.OPTIMAL: "OPTIMAL",
+            pywraplp.Solver.FEASIBLE: "FEASIBLE",
+            pywraplp.Solver.INFEASIBLE: "INFEASIBLE",
+            pywraplp.Solver.UNBOUNDED: "UNBOUNDED",
+            pywraplp.Solver.ABNORMAL: "ABNORMAL",
+            pywraplp.Solver.NOT_SOLVED: "NOT_SOLVED",
+        }
+        status_str = status_map.get(status, f"UNKNOWN_{status}")
+
+        if status not in (pywraplp.Solver.OPTIMAL, pywraplp.Solver.FEASIBLE):
+            return StochasticRPMLSolution(
+                payments=np.zeros((n, T)),
+                balances=np.zeros((n, T)),
+                active_loans=np.zeros((n, T)),
+                scenario_savings=np.zeros((n_scenarios, T)),
+                scenario_shortfalls=np.full((n_scenarios, T), float("inf")),
+                scenario_total_shortfalls=np.full(n_scenarios, float("inf")),
+                scenario_shortfall_events=np.ones(n_scenarios),
+                objective_value=float("inf"),
+                total_payment_cost=float("inf"),
+                cvar_shortfall=float("inf"),
+                expected_shortfall=float("inf"),
+                cash_shortfall_rate=1.0,
+                risk_alpha=self.risk_alpha,
+                risk_lambda=self.risk_lambda,
+                shortfall_epsilon=self.shortfall_epsilon,
+                shortfall_rate_beta=self.shortfall_rate_beta,
+                solve_time=solve_time,
+                gap=0.0,
+                status=status_str,
+            )
+
+        payments = np.zeros((n, T))
+        balances = np.zeros((n, T))
+        active_loans = np.zeros((n, T))
+        for j in range(n):
+            for t in range(T):
+                payments[j, t] = self.X[j, t].solution_value()
+                balances[j, t] = self.B[j, t].solution_value()
+                active_loans[j, t] = self.Z[j, t].solution_value()
+
+        scenario_savings = np.zeros((n_scenarios, T))
+        scenario_shortfalls = np.zeros((n_scenarios, T))
+        scenario_total_shortfalls = np.zeros(n_scenarios)
+        scenario_shortfall_events = np.zeros(n_scenarios)
+        for s in range(n_scenarios):
+            for t in range(T):
+                scenario_savings[s, t] = self.S[s, t].solution_value()
+                scenario_shortfalls[s, t] = self.shortfall[s, t].solution_value()
+            scenario_total_shortfalls[s] = self.scenario_shortfall[s].solution_value()
+            scenario_shortfall_events[s] = self.shortfall_event[s].solution_value()
+
+        total_payment_cost = float(np.sum(payments))
+        eta_val = self.eta.solution_value()
+        excess_vals = np.array([self.excess[s].solution_value() for s in range(n_scenarios)], dtype=float)
+        cvar_shortfall = float(
+            eta_val + np.sum(excess_vals) / ((1.0 - self.risk_alpha) * n_scenarios)
+        )
+        expected_shortfall = float(np.mean(scenario_total_shortfalls))
+        cash_shortfall_rate = float(np.mean(scenario_shortfall_events > 0.5))
+        obj_value = self.solver.Objective().Value()
+
+        gap = 0.0
+        if hasattr(self.solver, "GetBestObjectiveBound"):
+            try:
+                best_bound = self.solver.GetBestObjectiveBound()
+                if obj_value > 0:
+                    gap = abs(best_bound - obj_value) / obj_value * 100
+            except Exception:
+                pass
+
+        return StochasticRPMLSolution(
+            payments=payments,
+            balances=balances,
+            active_loans=active_loans,
+            scenario_savings=scenario_savings,
+            scenario_shortfalls=scenario_shortfalls,
+            scenario_total_shortfalls=scenario_total_shortfalls,
+            scenario_shortfall_events=scenario_shortfall_events,
+            objective_value=float(obj_value),
+            total_payment_cost=total_payment_cost,
+            cvar_shortfall=cvar_shortfall,
+            expected_shortfall=expected_shortfall,
+            cash_shortfall_rate=cash_shortfall_rate,
+            risk_alpha=self.risk_alpha,
+            risk_lambda=self.risk_lambda,
+            shortfall_epsilon=self.shortfall_epsilon,
+            shortfall_rate_beta=self.shortfall_rate_beta,
+            solve_time=solve_time,
+            gap=gap,
+            status=status_str,
+        )
+
+
+def solve_stochastic_rpml(
+    instance: RiosSolisInstance,
+    scenario_incomes: np.ndarray,
+    risk_alpha: float = 0.95,
+    risk_lambda: float = 1.0,
+    shortfall_epsilon: float = 1e-6,
+    shortfall_rate_beta: Optional[float] = None,
+    time_limit_seconds: Optional[int] = None,
+    solver_name: str = DEFAULT_SOLVER,
+    ru_mode: bool = False,
+) -> StochasticRPMLSolution:
+    model = StochasticRPMLModel(
+        instance=instance,
+        scenario_incomes=scenario_incomes,
+        risk_alpha=risk_alpha,
+        risk_lambda=risk_lambda,
+        shortfall_epsilon=shortfall_epsilon,
+        shortfall_rate_beta=shortfall_rate_beta,
+        time_limit_seconds=time_limit_seconds,
+        solver_name=solver_name,
+        ru_mode=ru_mode,
+    )
+    return model.solve()
+
+
+def evaluate_fixed_plan_shortfalls(
+    payments: np.ndarray,
+    scenario_incomes: np.ndarray | Sequence[Sequence[float]],
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Evaluate per-scenario monthly shortfalls for a fixed payment plan.
+    """
+
+    payments = np.asarray(payments, dtype=float)
+    scenario_incomes = np.asarray(scenario_incomes, dtype=float)
+    if payments.ndim != 2:
+        raise ValueError("payments must be a 2D array of shape (n_loans, T)")
+    if scenario_incomes.ndim != 2:
+        raise ValueError("scenario_incomes must be a 2D array of shape (n_scenarios, T)")
+    if payments.shape[1] != scenario_incomes.shape[1]:
+        raise ValueError(
+            "payments and scenario_incomes must have the same horizon T in second dimension"
+        )
+
+    n_scenarios, horizon = scenario_incomes.shape
+    monthly_required = np.sum(payments, axis=0)
+    shortfalls = np.zeros((n_scenarios, horizon), dtype=float)
+
+    for s in range(n_scenarios):
+        prev_savings = 0.0
+        for t in range(horizon):
+            available = float(scenario_incomes[s, t] + prev_savings)
+            required = float(monthly_required[t])
+            if required <= available:
+                shortfalls[s, t] = 0.0
+                prev_savings = available - required
+            else:
+                shortfalls[s, t] = required - available
+                prev_savings = 0.0
+
+    return shortfalls, np.sum(shortfalls, axis=1)
 

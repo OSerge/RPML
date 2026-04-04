@@ -5,8 +5,12 @@ from rpml.baseline import BaselineSolution
 from rpml.data_loader import RiosSolisInstance
 from rpml.metrics import (
     ComparisonResult,
+    StochasticRiskComparisonResult,
     aggregate_results,
     compare_solutions,
+    compute_cash_shortfall_rate,
+    compute_cvar,
+    print_stochastic_risk_summary,
     print_summary,
     validate_baseline_solution,
 )
@@ -226,3 +230,105 @@ def test_print_summary_reports_status_split(capsys):
     assert "8 loans" in out
     assert "Problem cases:" in out
     assert "FEASIBLE instances: feas-1 (24.00s, gap 2.00%)" in out
+
+
+def test_compute_cvar_matches_manual_tail_average():
+    samples = np.array([0.0, 1.0, 2.0, 3.0, 10.0], dtype=float)
+    cvar = compute_cvar(samples, alpha=0.8)
+
+    # VaR_0.8 = 3.0 => tail = [3.0, 10.0], mean = 6.5
+    assert cvar == pytest.approx(6.5)
+
+
+def test_compute_cash_shortfall_rate_counts_positive_events():
+    shortfalls = np.array([0.0, 0.0, 1e-7, 0.02, 1.5], dtype=float)
+    rate = compute_cash_shortfall_rate(shortfalls, epsilon=1e-6)
+
+    assert rate == pytest.approx(2 / 5)
+
+
+def test_print_stochastic_risk_summary_uses_optimal_only_for_deltas(capsys):
+    results = [
+        StochasticRiskComparisonResult(
+            instance_name="opt-1",
+            n_loans=4,
+            n_scenarios=8,
+            risk_alpha=0.95,
+            risk_lambda=1.0,
+            shortfall_epsilon=1e-6,
+            shortfall_rate_beta=0.5,
+            deterministic_status="OPTIMAL",
+            deterministic_cost=100.0,
+            deterministic_solve_time=1.0,
+            deterministic_gap=0.0,
+            deterministic_mean_shortfall=10.0,
+            deterministic_median_shortfall=10.0,
+            deterministic_p90_shortfall=20.0,
+            deterministic_max_shortfall=30.0,
+            deterministic_cvar_shortfall=40.0,
+            deterministic_cash_shortfall_rate=0.5,
+            stochastic_status="OPTIMAL",
+            stochastic_total_payment_cost=112.0,
+            stochastic_objective_value=112.0,
+            stochastic_solve_time=2.0,
+            stochastic_gap=0.0,
+            stochastic_mean_shortfall=4.0,
+            stochastic_median_shortfall=4.0,
+            stochastic_p90_shortfall=10.0,
+            stochastic_max_shortfall=15.0,
+            stochastic_cvar_shortfall=20.0,
+            stochastic_cash_shortfall_rate=0.25,
+            delta_total_payment_cost=12.0,
+            delta_cvar_shortfall=-20.0,
+            delta_cash_shortfall_rate=-0.25,
+            deterministic_scenario_shortfalls=[0.0, 40.0],
+            stochastic_scenario_shortfalls=[0.0, 20.0],
+        ),
+        StochasticRiskComparisonResult(
+            instance_name="feas-1",
+            n_loans=4,
+            n_scenarios=8,
+            risk_alpha=0.95,
+            risk_lambda=1.0,
+            shortfall_epsilon=1e-6,
+            shortfall_rate_beta=0.5,
+            deterministic_status="OPTIMAL",
+            deterministic_cost=100.0,
+            deterministic_solve_time=1.0,
+            deterministic_gap=0.0,
+            deterministic_mean_shortfall=10.0,
+            deterministic_median_shortfall=10.0,
+            deterministic_p90_shortfall=20.0,
+            deterministic_max_shortfall=30.0,
+            deterministic_cvar_shortfall=40.0,
+            deterministic_cash_shortfall_rate=0.5,
+            stochastic_status="FEASIBLE",
+            stochastic_total_payment_cost=500.0,
+            stochastic_objective_value=500.0,
+            stochastic_solve_time=9.0,
+            stochastic_gap=12.0,
+            stochastic_mean_shortfall=1.0,
+            stochastic_median_shortfall=1.0,
+            stochastic_p90_shortfall=2.0,
+            stochastic_max_shortfall=3.0,
+            stochastic_cvar_shortfall=1.0,
+            stochastic_cash_shortfall_rate=0.0,
+            delta_total_payment_cost=400.0,
+            delta_cvar_shortfall=-39.0,
+            delta_cash_shortfall_rate=-0.5,
+            deterministic_scenario_shortfalls=[0.0, 40.0],
+            stochastic_scenario_shortfalls=[0.0, 1.0],
+        ),
+    ]
+
+    print_stochastic_risk_summary(results)
+    out = capsys.readouterr().out
+
+    assert "Deterministic OPTIMAL coverage: 2/2 (100.0%)" in out
+    assert "Stochastic OPTIMAL coverage: 1/2 (50.0%)" in out
+    assert "Deterministic usable coverage: 2/2 (100.0%)" in out
+    assert "Stochastic usable coverage: 2/2 (100.0%)" in out
+    assert "Comparable OPTIMAL subset: 1/2 (50.0%)" in out
+    assert "Delta CVaR shortfall (stochastic - deterministic): avg -20.0000, median -20.0000" in out
+    assert "Delta Cash Shortfall Rate (stochastic - deterministic): avg -0.250000, median -0.250000" in out
+    assert "Delta total payment cost (stochastic - deterministic): avg 12.00, median 12.00" in out

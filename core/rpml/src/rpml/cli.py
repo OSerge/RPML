@@ -23,13 +23,23 @@ import numpy as np
 from tqdm import tqdm
 
 from rpml.data_loader import load_all_instances, get_instances_by_size, with_ru_prepayment_rules
-from rpml.milp_model import DEFAULT_SOLVER, FALLBACK_SOLVER, solve_rpml
+from rpml.milp_model import (
+    DEFAULT_SOLVER,
+    FALLBACK_SOLVER,
+    evaluate_fixed_plan_shortfalls,
+    solve_rpml,
+    solve_stochastic_rpml,
+)
 from rpml.baseline import debt_avalanche, debt_snowball
 from rpml.metrics import (
     ComparisonResult,
     MonteCarloAggregateResult,
+    StochasticRiskComparisonResult,
     aggregate_monte_carlo_results_from_comparisons,
+    compute_cash_shortfall_rate,
+    compute_cvar,
     compare_solutions,
+    print_stochastic_risk_summary,
     print_summary,
     validate_baseline_solution,
 )
@@ -78,6 +88,47 @@ MC_SCENARIO_CSV_COLUMNS = [
     "objective_cost",
     "solve_time",
     "gap",
+]
+
+H2_INSTANCE_CSV_COLUMNS = [
+    "instance_name",
+    "n_loans",
+    "n_scenarios",
+    "risk_alpha",
+    "risk_lambda",
+    "shortfall_epsilon",
+    "shortfall_rate_beta",
+    "deterministic_status",
+    "deterministic_cost",
+    "deterministic_solve_time",
+    "deterministic_gap",
+    "deterministic_mean_shortfall",
+    "deterministic_median_shortfall",
+    "deterministic_p90_shortfall",
+    "deterministic_max_shortfall",
+    "deterministic_cvar_shortfall",
+    "deterministic_cash_shortfall_rate",
+    "stochastic_status",
+    "stochastic_total_payment_cost",
+    "stochastic_objective_value",
+    "stochastic_solve_time",
+    "stochastic_gap",
+    "stochastic_mean_shortfall",
+    "stochastic_median_shortfall",
+    "stochastic_p90_shortfall",
+    "stochastic_max_shortfall",
+    "stochastic_cvar_shortfall",
+    "stochastic_cash_shortfall_rate",
+    "delta_total_payment_cost",
+    "delta_cvar_shortfall",
+    "delta_cash_shortfall_rate",
+]
+
+H2_SCENARIO_CSV_COLUMNS = [
+    "instance_name",
+    "scenario_index",
+    "deterministic_shortfall",
+    "stochastic_shortfall",
 ]
 
 
@@ -151,9 +202,10 @@ def _slugify_token(value: str) -> str:
 
 def _build_run_param_slug(args: argparse.Namespace) -> str:
     loan_counts = "-".join(str(x) for x in sorted(set(args.n_loans)))
+    stochastic_cvar = bool(getattr(args, "stochastic_cvar", False))
     parts = [
         "ru" if args.ru else "base",
-        "mc" if args.mc_income else "std",
+        "h2cvar" if stochastic_cvar else ("mc" if args.mc_income else "std"),
         f"n{loan_counts}",
         f"tl{args.time_limit}",
     ]
@@ -166,13 +218,22 @@ def _build_run_param_slug(args: argparse.Namespace) -> str:
                 f"seed{args.mc_seed}",
             ]
         )
+    if stochastic_cvar:
+        alpha = int(round(float(getattr(args, "risk_alpha", 0.95)) * 100))
+        lam = str(getattr(args, "risk_lambda", 1.0)).replace(".", "p")
+        parts.extend([f"a{alpha}", f"l{lam}"])
+        beta = getattr(args, "shortfall_rate_beta", None)
+        if beta is not None:
+            parts.append(f"b{str(beta).replace('.', 'p')}")
     return "_".join(_slugify_token(part) for part in parts)
 
 
 def _build_run_signature(args: argparse.Namespace, initial_solver_name: str) -> dict[str, Any]:
+    stochastic_cvar = bool(getattr(args, "stochastic_cvar", False))
     signature = {
         "ru": bool(args.ru),
         "mc_income": bool(args.mc_income),
+        "stochastic_cvar": stochastic_cvar,
         "n_loans": list(args.n_loans),
         "max_instances": args.max_instances,
         "time_limit": args.time_limit,
@@ -192,6 +253,15 @@ def _build_run_signature(args: argparse.Namespace, initial_solver_name: str) -> 
                 "mc_sigma": args.mc_sigma,
                 "mc_shock_prob": args.mc_shock_prob,
                 "mc_shock_severity": args.mc_shock_severity,
+            }
+        )
+    if stochastic_cvar:
+        signature.update(
+            {
+                "risk_alpha": float(getattr(args, "risk_alpha", 0.95)),
+                "risk_lambda": float(getattr(args, "risk_lambda", 1.0)),
+                "shortfall_epsilon": float(getattr(args, "shortfall_epsilon", 1e-6)),
+                "shortfall_rate_beta": getattr(args, "shortfall_rate_beta", None),
             }
         )
     return signature
@@ -272,18 +342,21 @@ def _create_run_id(args: argparse.Namespace, signature: dict[str, Any]) -> str:
 def _resolve_summary_checkpoint_for_run(
     run_dir: Path,
     prefer_mc: bool,
-) -> tuple[Path, bool]:
+) -> tuple[Path, bool, bool]:
     std_checkpoint = run_dir / "checkpoint" / "experiment_results_checkpoint.jsonl"
     mc_checkpoint = run_dir / "checkpoint" / "monte_carlo_experiment_results_checkpoint.jsonl"
+    h2_checkpoint = run_dir / "checkpoint" / "stochastic_cvar_experiment_results_checkpoint.jsonl"
+    if h2_checkpoint.exists() and not prefer_mc:
+        return h2_checkpoint, False, True
     if prefer_mc:
-        return mc_checkpoint, True
+        return mc_checkpoint, True, False
     if std_checkpoint.exists() and not mc_checkpoint.exists():
-        return std_checkpoint, False
+        return std_checkpoint, False, False
     if mc_checkpoint.exists() and not std_checkpoint.exists():
-        return mc_checkpoint, True
+        return mc_checkpoint, True, False
     if std_checkpoint.exists() and mc_checkpoint.exists():
-        return std_checkpoint, False
-    return std_checkpoint, False
+        return std_checkpoint, False, False
+    return std_checkpoint, False, False
 
 
 def resolve_solver_strategy(use_scip: bool) -> tuple[str, bool]:
@@ -333,6 +406,478 @@ def _write_mc_outputs(
         json.dump(metadata, f, ensure_ascii=False, indent=2)
 
     return output_path, scenario_path, metadata_path
+
+
+def _load_h2_checkpoint_results(
+    checkpoint_path: Path | None,
+) -> dict[str, StochasticRiskComparisonResult]:
+    if checkpoint_path is None or not checkpoint_path.exists():
+        return {}
+
+    out: dict[str, StochasticRiskComparisonResult] = {}
+    with open(checkpoint_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+                payload.setdefault("shortfall_rate_beta", None)
+                result = StochasticRiskComparisonResult(**payload)
+            except Exception:
+                continue
+            out[result.instance_name] = result
+    return out
+
+
+def _save_h2_checkpoint_result(
+    checkpoint_path: Path | None,
+    result: StochasticRiskComparisonResult,
+) -> None:
+    if checkpoint_path is None:
+        return
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(checkpoint_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(dataclasses.asdict(result), ensure_ascii=False) + "\n")
+
+
+def _write_h2_outputs(
+    output_path: Path,
+    results: list[StochasticRiskComparisonResult],
+    config: IncomeMCConfig,
+    risk_alpha: float,
+    risk_lambda: float,
+    shortfall_epsilon: float,
+    shortfall_rate_beta: float | None,
+    run_id: str | None = None,
+) -> tuple[Path, Path, Path]:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    scenario_path = output_path.with_name(f"{output_path.stem}_scenarios{output_path.suffix}")
+    metadata_path = output_path.with_name(f"{output_path.stem}_meta.json")
+
+    with open(output_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=H2_INSTANCE_CSV_COLUMNS)
+        writer.writeheader()
+        for item in results:
+            row = dataclasses.asdict(item)
+            row.pop("deterministic_scenario_shortfalls", None)
+            row.pop("stochastic_scenario_shortfalls", None)
+            writer.writerow(row)
+
+    with open(scenario_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=H2_SCENARIO_CSV_COLUMNS)
+        writer.writeheader()
+        for item in results:
+            for idx, (det_sf, stoch_sf) in enumerate(
+                zip(item.deterministic_scenario_shortfalls, item.stochastic_scenario_shortfalls)
+            ):
+                writer.writerow(
+                    {
+                        "instance_name": item.instance_name,
+                        "scenario_index": idx,
+                        "deterministic_shortfall": det_sf,
+                        "stochastic_shortfall": stoch_sf,
+                    }
+                )
+
+    metadata = {
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "income_mc_config": _serialize_mc_config(config),
+        "risk_alpha": risk_alpha,
+        "risk_lambda": risk_lambda,
+        "shortfall_epsilon": shortfall_epsilon,
+        "shortfall_rate_beta": shortfall_rate_beta,
+        "aggregates_file": str(output_path),
+        "scenarios_file": str(scenario_path),
+        "instance_count": len(results),
+        "scenario_count": int(sum(len(r.stochastic_scenario_shortfalls) for r in results)),
+    }
+    if run_id is not None:
+        metadata["run_id"] = run_id
+    with open(metadata_path, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, ensure_ascii=False, indent=2)
+
+    return output_path, scenario_path, metadata_path
+
+
+def _shortfall_stats(
+    scenario_shortfalls: np.ndarray,
+    alpha: float,
+    epsilon: float,
+    monthly_shortfalls: np.ndarray | None = None,
+) -> dict[str, float]:
+    if scenario_shortfalls.size == 0:
+        raise ValueError("scenario_shortfalls must not be empty")
+    if not np.all(np.isfinite(scenario_shortfalls)):
+        return {
+            "mean": float("inf"),
+            "median": float("inf"),
+            "p90": float("inf"),
+            "max": float("inf"),
+            "cvar": float("inf"),
+            "cash_shortfall_rate": 1.0,
+        }
+    return {
+        "mean": float(np.mean(scenario_shortfalls)),
+        "median": float(np.median(scenario_shortfalls)),
+        "p90": float(np.percentile(scenario_shortfalls, 90)),
+        "max": float(np.max(scenario_shortfalls)),
+        "cvar": compute_cvar(scenario_shortfalls, alpha=alpha),
+        "cash_shortfall_rate": compute_cash_shortfall_rate(
+            monthly_shortfalls if monthly_shortfalls is not None else scenario_shortfalls,
+            epsilon=epsilon,
+        ),
+    }
+
+
+def _build_stochastic_cvar_result(
+    *,
+    instance,
+    mc_config: IncomeMCConfig,
+    risk_alpha: float,
+    risk_lambda: float,
+    shortfall_epsilon: float,
+    shortfall_rate_beta: float | None,
+    time_limit_seconds: int,
+    solver_name: str,
+    ru_mode: bool,
+) -> StochasticRiskComparisonResult:
+    instance_seed = derive_instance_seed(mc_config.seed, instance.name)
+    instance_mc_config = dataclasses.replace(mc_config, seed=instance_seed)
+    scenario_incomes = simulate_income_paths(instance.monthly_income, instance_mc_config)
+
+    deterministic = solve_rpml(
+        instance,
+        time_limit_seconds=time_limit_seconds,
+        solver_name=solver_name,
+        ru_mode=ru_mode,
+    )
+    deterministic_ok = deterministic.status in ("OPTIMAL", "FEASIBLE")
+    if deterministic_ok:
+        deterministic_monthly_shortfalls, deterministic_scenario_shortfalls = (
+            evaluate_fixed_plan_shortfalls(
+                deterministic.payments,
+                scenario_incomes,
+            )
+        )
+    else:
+        deterministic_monthly_shortfalls = np.full(
+            scenario_incomes.shape, float("inf"), dtype=float
+        )
+        deterministic_scenario_shortfalls = np.full(
+            scenario_incomes.shape[0], float("inf"), dtype=float
+        )
+
+    stochastic = solve_stochastic_rpml(
+        instance=instance,
+        scenario_incomes=scenario_incomes,
+        risk_alpha=risk_alpha,
+        risk_lambda=risk_lambda,
+        shortfall_epsilon=shortfall_epsilon,
+        shortfall_rate_beta=shortfall_rate_beta,
+        time_limit_seconds=time_limit_seconds,
+        solver_name=solver_name,
+        ru_mode=ru_mode,
+    )
+    stochastic_scenario_shortfalls = np.asarray(
+        stochastic.scenario_total_shortfalls, dtype=float
+    )
+    stochastic_monthly_shortfalls = np.asarray(
+        stochastic.scenario_shortfalls, dtype=float
+    )
+
+    det_stats = _shortfall_stats(
+        deterministic_scenario_shortfalls,
+        alpha=risk_alpha,
+        epsilon=shortfall_epsilon,
+        monthly_shortfalls=deterministic_monthly_shortfalls,
+    )
+    stoch_stats = _shortfall_stats(
+        stochastic_scenario_shortfalls,
+        alpha=risk_alpha,
+        epsilon=shortfall_epsilon,
+        monthly_shortfalls=stochastic_monthly_shortfalls,
+    )
+    stoch_stats["cash_shortfall_rate"] = float(stochastic.cash_shortfall_rate)
+
+    det_cost = float(deterministic.objective_value)
+    stoch_cost = float(stochastic.total_payment_cost)
+    delta_cost = (
+        stoch_cost - det_cost
+        if np.isfinite(det_cost) and np.isfinite(stoch_cost)
+        else float("inf")
+    )
+
+    return StochasticRiskComparisonResult(
+        instance_name=instance.name,
+        n_loans=instance.n,
+        n_scenarios=int(scenario_incomes.shape[0]),
+        risk_alpha=risk_alpha,
+        risk_lambda=risk_lambda,
+        shortfall_epsilon=shortfall_epsilon,
+        shortfall_rate_beta=shortfall_rate_beta,
+        deterministic_status=deterministic.status,
+        deterministic_cost=det_cost,
+        deterministic_solve_time=float(deterministic.solve_time),
+        deterministic_gap=float(deterministic.gap),
+        deterministic_mean_shortfall=det_stats["mean"],
+        deterministic_median_shortfall=det_stats["median"],
+        deterministic_p90_shortfall=det_stats["p90"],
+        deterministic_max_shortfall=det_stats["max"],
+        deterministic_cvar_shortfall=det_stats["cvar"],
+        deterministic_cash_shortfall_rate=det_stats["cash_shortfall_rate"],
+        stochastic_status=stochastic.status,
+        stochastic_total_payment_cost=stoch_cost,
+        stochastic_objective_value=float(stochastic.objective_value),
+        stochastic_solve_time=float(stochastic.solve_time),
+        stochastic_gap=float(stochastic.gap),
+        stochastic_mean_shortfall=stoch_stats["mean"],
+        stochastic_median_shortfall=stoch_stats["median"],
+        stochastic_p90_shortfall=stoch_stats["p90"],
+        stochastic_max_shortfall=stoch_stats["max"],
+        stochastic_cvar_shortfall=stoch_stats["cvar"],
+        stochastic_cash_shortfall_rate=stoch_stats["cash_shortfall_rate"],
+        delta_total_payment_cost=delta_cost,
+        delta_cvar_shortfall=float(
+            stoch_stats["cvar"] - det_stats["cvar"]
+            if np.isfinite(stoch_stats["cvar"]) and np.isfinite(det_stats["cvar"])
+            else float("inf")
+        ),
+        delta_cash_shortfall_rate=float(
+            stoch_stats["cash_shortfall_rate"] - det_stats["cash_shortfall_rate"]
+        ),
+        deterministic_scenario_shortfalls=deterministic_scenario_shortfalls.astype(float).tolist(),
+        stochastic_scenario_shortfalls=stochastic_scenario_shortfalls.astype(float).tolist(),
+    )
+
+
+def run_stochastic_cvar_experiments(
+    dataset_path: Path,
+    mc_config: IncomeMCConfig,
+    risk_alpha: float,
+    risk_lambda: float,
+    shortfall_epsilon: float,
+    shortfall_rate_beta: float | None = None,
+    max_instances_per_group: int | None = None,
+    time_limit_seconds: int = 300,
+    verbose: bool = True,
+    allowed_n_loans: tuple[int, ...] = (4, 8),
+    solver_name: str = DEFAULT_SOLVER,
+    checkpoint_path: Path | None = None,
+    restart: bool = False,
+    ru_mode: bool = False,
+) -> list[StochasticRiskComparisonResult]:
+    if restart and checkpoint_path is not None and checkpoint_path.exists():
+        checkpoint_path.unlink()
+
+    existing = _load_h2_checkpoint_results(checkpoint_path)
+    processed = set(existing.keys())
+
+    if verbose:
+        print("Loading instances...")
+
+    instances = load_all_instances(dataset_path)
+    grouped = get_instances_by_size(instances)
+
+    selected_instances = []
+    for n_loans in allowed_n_loans:
+        group_instances = grouped.get(n_loans, [])
+        if max_instances_per_group:
+            group_instances = group_instances[:max_instances_per_group]
+        selected_instances.extend(group_instances)
+
+    if verbose:
+        print(f"Loaded {len(instances)} instances")
+        print(f"Selected for H2: {len(selected_instances)} instances")
+        if processed:
+            print(f"Resuming H2: {len(processed)} instance(s) already in checkpoint")
+
+    results: list[StochasticRiskComparisonResult] = list(existing.values())
+    iterator = tqdm(selected_instances, file=sys.stdout) if verbose else selected_instances
+
+    for instance in iterator:
+        if instance.name in processed:
+            if verbose:
+                tqdm.write(f"Skipping {instance.name} (already processed in H2 checkpoint)", file=sys.stdout)
+            continue
+
+        try:
+            result = _build_stochastic_cvar_result(
+                instance=instance,
+                mc_config=mc_config,
+                risk_alpha=risk_alpha,
+                risk_lambda=risk_lambda,
+                shortfall_epsilon=shortfall_epsilon,
+                shortfall_rate_beta=shortfall_rate_beta,
+                time_limit_seconds=time_limit_seconds,
+                solver_name=solver_name,
+                ru_mode=ru_mode,
+            )
+            results.append(result)
+            _save_h2_checkpoint_result(checkpoint_path, result)
+            processed.add(instance.name)
+        except Exception as exc:
+            if verbose:
+                print(f"\nError processing {instance.name} in stochastic CVaR mode: {exc}")
+            continue
+
+    results.sort(key=lambda item: item.instance_name)
+    return results
+
+
+def process_stochastic_cvar_instance(args_tuple):
+    (
+        instance,
+        mc_config,
+        risk_alpha,
+        risk_lambda,
+        shortfall_epsilon,
+        shortfall_rate_beta,
+        time_limit_seconds,
+        solver_name,
+        ru_mode,
+    ) = args_tuple
+    try:
+        result = _build_stochastic_cvar_result(
+            instance=instance,
+            mc_config=mc_config,
+            risk_alpha=risk_alpha,
+            risk_lambda=risk_lambda,
+            shortfall_epsilon=shortfall_epsilon,
+            shortfall_rate_beta=shortfall_rate_beta,
+            time_limit_seconds=time_limit_seconds,
+            solver_name=solver_name,
+            ru_mode=ru_mode,
+        )
+        return ("ok", result)
+    except Exception as e:
+        return ("error", instance.name, str(e))
+
+
+def run_stochastic_cvar_experiments_parallel(
+    dataset_path: Path,
+    mc_config: IncomeMCConfig,
+    risk_alpha: float,
+    risk_lambda: float,
+    shortfall_epsilon: float,
+    shortfall_rate_beta: float | None = None,
+    max_instances_per_group: int | None = None,
+    time_limit_seconds: int = 300,
+    verbose: bool = True,
+    allowed_n_loans: tuple[int, ...] = (4, 8),
+    solver_name: str = DEFAULT_SOLVER,
+    n_workers: int | None = None,
+    checkpoint_path: Path | None = None,
+    restart: bool = False,
+    ru_mode: bool = False,
+) -> list[StochasticRiskComparisonResult]:
+    from multiprocessing import cpu_count
+
+    if restart and checkpoint_path is not None and checkpoint_path.exists():
+        checkpoint_path.unlink()
+
+    existing = _load_h2_checkpoint_results(checkpoint_path)
+    processed = set(existing.keys())
+
+    if verbose:
+        print("Loading instances...")
+
+    instances = load_all_instances(dataset_path)
+    grouped = get_instances_by_size(instances)
+
+    selected_instances = []
+    for n_loans in allowed_n_loans:
+        group_instances = grouped.get(n_loans, [])
+        if max_instances_per_group:
+            group_instances = group_instances[:max_instances_per_group]
+        selected_instances.extend(group_instances)
+
+    instances_to_process = [
+        instance for instance in selected_instances if instance.name not in processed
+    ]
+
+    if verbose:
+        print(f"Loaded {len(instances)} instances")
+        print(f"Selected for H2: {len(selected_instances)} instances")
+        if processed:
+            print(f"Resuming H2: {len(processed)} instance(s) already in checkpoint")
+        print(
+            f"\nProcessing {len(instances_to_process)} instances in parallel with stochastic CVaR..."
+        )
+
+    worker_count = n_workers or cpu_count()
+    if verbose:
+        print(f"Using {worker_count} workers")
+
+    args_list = [
+        (
+            instance,
+            mc_config,
+            risk_alpha,
+            risk_lambda,
+            shortfall_epsilon,
+            shortfall_rate_beta,
+            time_limit_seconds,
+            solver_name,
+            ru_mode,
+        )
+        for instance in instances_to_process
+    ]
+
+    results: list[StochasticRiskComparisonResult] = list(existing.values())
+    executor = None
+    submitted = []
+
+    def _kill_executor_workers(current_executor) -> None:
+        processes = getattr(current_executor, "_processes", {}) or {}
+        for proc in processes.values():
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        try:
+            current_executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+
+    pbar_ctx = tqdm(total=len(args_list), file=sys.stdout) if verbose else nullcontext()
+    try:
+        with pbar_ctx as pbar:
+            executor = futures.ProcessPoolExecutor(max_workers=worker_count)
+            submitted = [
+                executor.submit(process_stochastic_cvar_instance, args)
+                for args in args_list
+            ]
+            for future in futures.as_completed(submitted):
+                result = future.result()
+                if result and result[0] == "ok":
+                    h2_result = result[1]
+                    results.append(h2_result)
+                    _save_h2_checkpoint_result(checkpoint_path, h2_result)
+                elif result and result[0] == "error" and verbose:
+                    print(f"Error processing {result[1]} in stochastic CVaR mode: {result[2]}")
+                if pbar is not None:
+                    pbar.update(1)
+    except KeyboardInterrupt:
+        if verbose:
+            print("\nInterrupted by user. Shutting down stochastic CVaR workers...")
+        for future in submitted:
+            if hasattr(future, "cancel"):
+                future.cancel()
+        if executor is not None:
+            _kill_executor_workers(executor)
+        raise
+    finally:
+        if executor is not None:
+            try:
+                executor.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
+
+    if checkpoint_path is not None:
+        results = list(_load_h2_checkpoint_results(checkpoint_path).values())
+    results.sort(key=lambda item: item.instance_name)
+    return results
 
 
 def load_timeout_instances(timeout_log_path: Path | None) -> set[str]:
@@ -771,15 +1316,26 @@ def process_monte_carlo_instance(args_tuple):
     """
     Process one base instance in Monte Carlo mode (for multiprocessing).
     """
-    (
-        instance,
-        mc_config,
-        time_limit_seconds,
-        solver_name,
-        checkpoint_path,
-        existing_scenario_results,
-        ru_mode,
-    ) = args_tuple
+    if len(args_tuple) == 6:
+        (
+            instance,
+            mc_config,
+            time_limit_seconds,
+            solver_name,
+            checkpoint_path,
+            existing_scenario_results,
+        ) = args_tuple
+        ru_mode = False
+    else:
+        (
+            instance,
+            mc_config,
+            time_limit_seconds,
+            solver_name,
+            checkpoint_path,
+            existing_scenario_results,
+            ru_mode,
+        ) = args_tuple
     try:
         aggregate, scenario_rows, scenario_comparisons = _run_monte_carlo_for_instance(
             instance=instance,
@@ -1064,7 +1620,8 @@ def run_monte_carlo_experiments_parallel(
         if verbose:
             print("\nInterrupted by user. Shutting down Monte Carlo workers...")
         for future in submitted:
-            future.cancel()
+            if hasattr(future, "cancel"):
+                future.cancel()
         if executor is not None:
             _kill_executor_workers(executor)
         raise
@@ -1275,6 +1832,46 @@ def parse_args() -> argparse.Namespace:
         metavar="PATH",
         help="CSV path for Monte Carlo aggregated results (default: tmp/mc_income_results.csv)",
     )
+    parser.add_argument(
+        "--stochastic-cvar",
+        action="store_true",
+        help="Enable stochastic RPML mode with CVaR objective on scenario shortfalls",
+    )
+    parser.add_argument(
+        "--risk-alpha",
+        type=float,
+        default=0.95,
+        metavar="A",
+        help="CVaR confidence level alpha in (0, 1)",
+    )
+    parser.add_argument(
+        "--risk-lambda",
+        type=float,
+        default=1.0,
+        metavar="L",
+        help="Weight of CVaR term in objective",
+    )
+    parser.add_argument(
+        "--shortfall-epsilon",
+        type=float,
+        default=1e-6,
+        metavar="EPS",
+        help="Threshold for counting scenario cash shortfall event",
+    )
+    parser.add_argument(
+        "--shortfall-rate-beta",
+        type=float,
+        default=None,
+        metavar="B",
+        help="Upper bound on Cash Shortfall Rate in [0, 1]",
+    )
+    parser.add_argument(
+        "--h2-output",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="CSV path for stochastic CVaR aggregated results",
+    )
     
     args = parser.parse_args()
     if args.run_id and args.resume_last:
@@ -1284,6 +1881,18 @@ def parse_args() -> argparse.Namespace:
     )
     if args.force_params_mismatch and not run_mode_requested:
         parser.error("--force-params-mismatch requires run mode (--run/--run-id/--resume-last)")
+    if args.stochastic_cvar and args.risk_lambda < 0:
+        parser.error("--risk-lambda must be >= 0")
+    if args.stochastic_cvar and not (0.0 < args.risk_alpha < 1.0):
+        parser.error("--risk-alpha must be in (0, 1)")
+    if args.stochastic_cvar and args.shortfall_epsilon < 0:
+        parser.error("--shortfall-epsilon must be >= 0")
+    if (
+        args.stochastic_cvar
+        and args.shortfall_rate_beta is not None
+        and not (0.0 <= args.shortfall_rate_beta <= 1.0)
+    ):
+        parser.error("--shortfall-rate-beta must be in [0, 1]")
     return args
 
 
@@ -1622,6 +2231,46 @@ def main():
     try:
         args = parse_args()
 
+        default_args = {
+            "max_instances": None,
+            "n_loans": [4, 8],
+            "time_limit": 300,
+            "watchdog_grace_seconds": 15,
+            "parallel": False,
+            "workers": None,
+            "checkpoint": None,
+            "restart": False,
+            "summary": False,
+            "timeout_log": None,
+            "include_known_timeouts": False,
+            "scip": False,
+            "ru": False,
+            "run": False,
+            "run_id": None,
+            "resume_last": False,
+            "runs_dir": None,
+            "force_params_mismatch": False,
+            "export_timelines": False,
+            "timelines_dir": None,
+            "mc_income": False,
+            "mc_scenarios": 16,
+            "mc_seed": 42,
+            "mc_rho": 0.55,
+            "mc_sigma": 0.15,
+            "mc_shock_prob": 0.04,
+            "mc_shock_severity": 0.30,
+            "stochastic_cvar": False,
+            "risk_alpha": 0.95,
+            "risk_lambda": 1.0,
+            "shortfall_epsilon": 1e-6,
+            "shortfall_rate_beta": None,
+            "h2_output": None,
+            "mc_output": None,
+        }
+        for key, value in default_args.items():
+            if not hasattr(args, key):
+                setattr(args, key, value)
+
         dataset_path = PROJECT_ROOT / "RiosSolisDataset" / "Instances" / "Instances"
         if not dataset_path.exists():
             print(f"Error: Dataset path not found: {dataset_path}")
@@ -1629,12 +2278,14 @@ def main():
 
         initial_solver_name, enable_solver_fallback = resolve_solver_strategy(args.scip)
         base_tmp_dir = PROJECT_ROOT / "tmp"
+        stochastic_cvar_mode = bool(getattr(args, "stochastic_cvar", False))
         run_mode_requested = bool(
             args.run or args.run_id is not None or args.resume_last or args.runs_dir is not None
         )
         run_id: str | None = None
         runs_root = args.runs_dir or (base_tmp_dir / "runs")
-        effective_mc_mode = args.mc_income
+        effective_mc_mode = bool(args.mc_income)
+        effective_h2_mode = stochastic_cvar_mode
 
         if run_mode_requested:
             runs_root.mkdir(parents=True, exist_ok=True)
@@ -1691,46 +2342,68 @@ def main():
 
             tmp_dir = run_dir
             mc_tmp_dir = run_dir / "monte_carlo"
+            h2_tmp_dir = run_dir / "stochastic_cvar"
             if args.summary and args.checkpoint is None:
-                default_checkpoint_path, effective_mc_mode = _resolve_summary_checkpoint_for_run(
+                (
+                    default_checkpoint_path,
+                    effective_mc_mode,
+                    effective_h2_mode,
+                ) = _resolve_summary_checkpoint_for_run(
                     run_dir,
                     args.mc_income,
                 )
             else:
-                default_checkpoint_path = (
-                    run_dir / "checkpoint" / "monte_carlo_experiment_results_checkpoint.jsonl"
-                    if effective_mc_mode
-                    else run_dir / "checkpoint" / "experiment_results_checkpoint.jsonl"
-                )
+                if effective_h2_mode:
+                    default_checkpoint_path = (
+                        run_dir / "checkpoint" / "stochastic_cvar_experiment_results_checkpoint.jsonl"
+                    )
+                else:
+                    default_checkpoint_path = (
+                        run_dir / "checkpoint" / "monte_carlo_experiment_results_checkpoint.jsonl"
+                        if effective_mc_mode
+                        else run_dir / "checkpoint" / "experiment_results_checkpoint.jsonl"
+                    )
             default_timeout_log_path = (
                 run_dir / "logs" / "monte_carlo_timeout_instances.csv"
                 if effective_mc_mode
                 else run_dir / "logs" / "timeout_instances.csv"
             )
-            default_results_csv_path = (
-                run_dir / "exports" / "monte_carlo_experiment_results.csv"
-                if effective_mc_mode
-                else run_dir / "exports" / "experiment_results.csv"
-            )
+            if effective_h2_mode:
+                default_results_csv_path = (
+                    run_dir / "exports" / "stochastic_cvar_experiment_results.csv"
+                )
+            else:
+                default_results_csv_path = (
+                    run_dir / "exports" / "monte_carlo_experiment_results.csv"
+                    if effective_mc_mode
+                    else run_dir / "exports" / "experiment_results.csv"
+                )
             default_timelines_dir = run_dir / "timelines"
         else:
             tmp_dir = base_tmp_dir / "ru" if args.ru else base_tmp_dir
             mc_tmp_dir = tmp_dir / "monte_carlo"
-            default_checkpoint_path = (
-                mc_tmp_dir / "experiment_results_checkpoint.jsonl"
-                if effective_mc_mode
-                else tmp_dir / "experiment_results_checkpoint.jsonl"
-            )
+            h2_tmp_dir = tmp_dir / "stochastic_cvar"
+            if effective_h2_mode:
+                default_checkpoint_path = h2_tmp_dir / "experiment_results_checkpoint.jsonl"
+            else:
+                default_checkpoint_path = (
+                    mc_tmp_dir / "experiment_results_checkpoint.jsonl"
+                    if effective_mc_mode
+                    else tmp_dir / "experiment_results_checkpoint.jsonl"
+                )
             default_timeout_log_path = (
                 mc_tmp_dir / "timeout_instances.csv"
                 if effective_mc_mode
                 else tmp_dir / "timeout_instances.csv"
             )
-            default_results_csv_path = (
-                mc_tmp_dir / "experiment_results.csv"
-                if effective_mc_mode
-                else tmp_dir / "experiment_results.csv"
-            )
+            if effective_h2_mode:
+                default_results_csv_path = h2_tmp_dir / "experiment_results.csv"
+            else:
+                default_results_csv_path = (
+                    mc_tmp_dir / "experiment_results.csv"
+                    if effective_mc_mode
+                    else tmp_dir / "experiment_results.csv"
+                )
             default_timelines_dir = tmp_dir / "timelines"
 
         checkpoint_path = args.checkpoint or default_checkpoint_path
@@ -1747,6 +2420,38 @@ def main():
             print(f"\nLoading results from: {checkpoint_path}\n")
             if not checkpoint_path.exists():
                 print("No checkpoint file found for the selected run/path.")
+                return 0
+
+            if effective_h2_mode:
+                h2_results = list(_load_h2_checkpoint_results(checkpoint_path).values())
+                if not h2_results:
+                    print("No stochastic CVaR results found in checkpoint.")
+                    return 0
+                print_stochastic_risk_summary(h2_results)
+                mc_config = IncomeMCConfig(
+                    n_scenarios=args.mc_scenarios,
+                    seed=args.mc_seed,
+                    rho=args.mc_rho,
+                    sigma=args.mc_sigma,
+                    shock_prob=args.mc_shock_prob,
+                    shock_severity_mean=args.mc_shock_severity,
+                    shock_severity_std=max(args.mc_shock_severity * 0.25, 0.01),
+                    min_income_floor=1.0,
+                )
+                csv_path = args.h2_output or default_results_csv_path
+                instance_csv, scenario_csv, metadata_json = _write_h2_outputs(
+                    output_path=csv_path,
+                    results=h2_results,
+                    config=mc_config,
+                    risk_alpha=args.risk_alpha,
+                    risk_lambda=args.risk_lambda,
+                    shortfall_epsilon=args.shortfall_epsilon,
+                    shortfall_rate_beta=args.shortfall_rate_beta,
+                    run_id=run_id,
+                )
+                print(f"\nResults exported to: {instance_csv}")
+                print(f"Scenario export: {scenario_csv}")
+                print(f"Metadata export: {metadata_json}")
                 return 0
 
             checkpoint = CheckpointManager(checkpoint_path)
@@ -1788,14 +2493,23 @@ def main():
         print(f"  Export timelines: {'yes' if args.export_timelines else 'no'}")
         if args.export_timelines:
             print(f"  Timelines dir: {timelines_dir}")
+        print(f"  Stochastic CVaR mode: {'yes' if stochastic_cvar_mode else 'no'}")
         print(f"  Monte Carlo income mode: {'yes' if args.mc_income else 'no'}")
-        if args.mc_income:
+        if args.mc_income or stochastic_cvar_mode:
             print(f"  MC scenarios: {args.mc_scenarios}")
             print(f"  MC seed: {args.mc_seed}")
             print(f"  MC rho: {args.mc_rho}")
             print(f"  MC sigma: {args.mc_sigma}")
             print(f"  MC shock prob: {args.mc_shock_prob}")
             print(f"  MC shock severity: {args.mc_shock_severity}")
+        if stochastic_cvar_mode:
+            print(f"  CVaR alpha: {args.risk_alpha}")
+            print(f"  Risk lambda: {args.risk_lambda}")
+            print(f"  Shortfall epsilon: {args.shortfall_epsilon}")
+            print(
+                "  Shortfall rate beta: "
+                + ("none" if args.shortfall_rate_beta is None else str(args.shortfall_rate_beta))
+            )
         print(f"  Skip known timeouts: {'no' if args.include_known_timeouts else 'yes'}")
         if args.restart:
             print("  Restart: yes (ignoring existing checkpoint)")
@@ -1804,6 +2518,76 @@ def main():
         try:
             if run_dir is not None:
                 _write_run_state(run_dir, "running")
+
+            if stochastic_cvar_mode:
+                h2_output_path = args.h2_output or (h2_tmp_dir / "stochastic_cvar_results.csv")
+                mc_config = IncomeMCConfig(
+                    n_scenarios=args.mc_scenarios,
+                    seed=args.mc_seed,
+                    rho=args.mc_rho,
+                    sigma=args.mc_sigma,
+                    shock_prob=args.mc_shock_prob,
+                    shock_severity_mean=args.mc_shock_severity,
+                    shock_severity_std=max(args.mc_shock_severity * 0.25, 0.01),
+                    min_income_floor=1.0,
+                )
+                mc_config.validate()
+
+                if args.parallel:
+                    h2_results = run_stochastic_cvar_experiments_parallel(
+                        dataset_path=dataset_path,
+                        mc_config=mc_config,
+                        risk_alpha=args.risk_alpha,
+                        risk_lambda=args.risk_lambda,
+                        shortfall_epsilon=args.shortfall_epsilon,
+                        shortfall_rate_beta=args.shortfall_rate_beta,
+                        max_instances_per_group=args.max_instances,
+                        time_limit_seconds=args.time_limit,
+                        verbose=True,
+                        allowed_n_loans=tuple(args.n_loans),
+                        solver_name=initial_solver_name,
+                        n_workers=args.workers,
+                        checkpoint_path=checkpoint_path,
+                        restart=args.restart,
+                        ru_mode=args.ru,
+                    )
+                else:
+                    h2_results = run_stochastic_cvar_experiments(
+                        dataset_path=dataset_path,
+                        mc_config=mc_config,
+                        risk_alpha=args.risk_alpha,
+                        risk_lambda=args.risk_lambda,
+                        shortfall_epsilon=args.shortfall_epsilon,
+                        shortfall_rate_beta=args.shortfall_rate_beta,
+                        max_instances_per_group=args.max_instances,
+                        time_limit_seconds=args.time_limit,
+                        verbose=True,
+                        allowed_n_loans=tuple(args.n_loans),
+                        solver_name=initial_solver_name,
+                        checkpoint_path=checkpoint_path,
+                        restart=args.restart,
+                        ru_mode=args.ru,
+                    )
+                instance_csv, scenario_csv, metadata_json = _write_h2_outputs(
+                    output_path=h2_output_path,
+                    results=h2_results,
+                    config=mc_config,
+                    risk_alpha=args.risk_alpha,
+                    risk_lambda=args.risk_lambda,
+                    shortfall_epsilon=args.shortfall_epsilon,
+                    shortfall_rate_beta=args.shortfall_rate_beta,
+                    run_id=run_id,
+                )
+                print("\n" + "=" * 60)
+                print("STOCHASTIC CVAR SUMMARY")
+                print("=" * 60)
+                print_stochastic_risk_summary(h2_results)
+                print(f"H2 aggregate CSV: {instance_csv}")
+                print(f"H2 scenario CSV: {scenario_csv}")
+                print(f"H2 metadata JSON: {metadata_json}")
+                if run_dir is not None:
+                    _write_run_state(run_dir, "completed")
+                return 0
 
             if args.mc_income:
                 mc_output_path = args.mc_output or (mc_tmp_dir / "mc_income_results.csv")
