@@ -647,8 +647,15 @@ def print_stochastic_risk_summary(results: list[StochasticRiskComparisonResult])
         return arr[np.isfinite(arr)]
 
     total = len(results)
-    stoch_optimal = sum(1 for r in results if r.stochastic_status in ("OPTIMAL", "FEASIBLE"))
-    det_optimal = sum(1 for r in results if r.deterministic_status in ("OPTIMAL", "FEASIBLE"))
+    comparable_optimal = [
+        r
+        for r in results
+        if r.deterministic_status == "OPTIMAL" and r.stochastic_status == "OPTIMAL"
+    ]
+    det_optimal = sum(1 for r in results if r.deterministic_status == "OPTIMAL")
+    stoch_optimal = sum(1 for r in results if r.stochastic_status == "OPTIMAL")
+    det_usable = sum(1 for r in results if r.deterministic_status in ("OPTIMAL", "FEASIBLE"))
+    stoch_usable = sum(1 for r in results if r.stochastic_status in ("OPTIMAL", "FEASIBLE"))
     beta_values = sorted(
         {
             float(r.shortfall_rate_beta)
@@ -657,16 +664,22 @@ def print_stochastic_risk_summary(results: list[StochasticRiskComparisonResult])
         }
     )
 
-    delta_cost = _finite([r.delta_total_payment_cost for r in results])
-    delta_cvar = _finite([r.delta_cvar_shortfall for r in results])
-    delta_rate = _finite([r.delta_cash_shortfall_rate for r in results])
+    delta_cost = _finite([r.delta_total_payment_cost for r in comparable_optimal])
+    delta_cvar = _finite([r.delta_cvar_shortfall for r in comparable_optimal])
+    delta_rate = _finite([r.delta_cash_shortfall_rate for r in comparable_optimal])
 
     print("=" * 60)
     print("STOCHASTIC CVAR EXPERIMENT SUMMARY")
     print("=" * 60)
     print(f"\nTotal base instances: {total}")
-    print(f"Deterministic usable coverage: {det_optimal}/{total} ({100.0 * det_optimal / total:.1f}%)")
-    print(f"Stochastic usable coverage: {stoch_optimal}/{total} ({100.0 * stoch_optimal / total:.1f}%)")
+    print(f"Deterministic OPTIMAL coverage: {det_optimal}/{total} ({100.0 * det_optimal / total:.1f}%)")
+    print(f"Stochastic OPTIMAL coverage: {stoch_optimal}/{total} ({100.0 * stoch_optimal / total:.1f}%)")
+    print(f"Deterministic usable coverage: {det_usable}/{total} ({100.0 * det_usable / total:.1f}%)")
+    print(f"Stochastic usable coverage: {stoch_usable}/{total} ({100.0 * stoch_usable / total:.1f}%)")
+    print(
+        f"Comparable OPTIMAL subset: {len(comparable_optimal)}/{total} "
+        f"({100.0 * len(comparable_optimal) / total:.1f}%)"
+    )
     if beta_values:
         if len(beta_values) == 1:
             print(f"Shortfall rate beta: {beta_values[0]:.6f}")
