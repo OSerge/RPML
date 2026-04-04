@@ -10,13 +10,16 @@ from rpml.cli import (
     main,
     parse_args,
     process_monte_carlo_instance,
+    process_stochastic_cvar_instance,
     resolve_solver_strategy,
     run_monte_carlo_experiments,
     run_monte_carlo_experiments_parallel,
+    run_stochastic_cvar_experiments,
+    run_stochastic_cvar_experiments_parallel,
 )
 from rpml.checkpoint import CheckpointManager
 from rpml.income_monte_carlo import IncomeMCConfig
-from rpml.metrics import ComparisonResult, MonteCarloAggregateResult
+from rpml.metrics import ComparisonResult, MonteCarloAggregateResult, StochasticRiskComparisonResult
 from rpml.milp_model import DEFAULT_SOLVER, FALLBACK_SOLVER
 
 
@@ -902,3 +905,335 @@ def test_run_monte_carlo_parallel_resumes_only_missing_scenarios(monkeypatch, tm
     assert len(aggregates) == 1
     assert len(scenario_rows) == 2
     assert [r.instance_name for r in scenario_comparisons] == ["inst_a__mc_0", "inst_a__mc_1"]
+
+
+def test_parse_args_accepts_stochastic_cvar_flags(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run-experiments",
+            "--stochastic-cvar",
+            "--risk-alpha",
+            "0.9",
+            "--risk-lambda",
+            "2.5",
+            "--shortfall-epsilon",
+            "0.01",
+            "--shortfall-rate-beta",
+            "0.25",
+            "--h2-output",
+            "tmp/h2.csv",
+        ],
+    )
+
+    args = parse_args()
+
+    assert args.stochastic_cvar is True
+    assert args.risk_alpha == 0.9
+    assert args.risk_lambda == 2.5
+    assert args.shortfall_epsilon == 0.01
+    assert args.shortfall_rate_beta == 0.25
+    assert str(args.h2_output).endswith("tmp/h2.csv")
+
+
+def test_run_stochastic_cvar_experiments_returns_results(monkeypatch):
+    instance = SimpleNamespace(name="inst_a", n=4, monthly_income=np.array([100.0, 100.0, 100.0]))
+    captured = {"shortfall_rate_beta": None}
+
+    monkeypatch.setattr("rpml.cli.load_all_instances", lambda _: [instance])
+    monkeypatch.setattr("rpml.cli.get_instances_by_size", lambda _: {4: [instance]})
+    monkeypatch.setattr("rpml.cli.derive_instance_seed", lambda base_seed, instance_name: 11)
+    monkeypatch.setattr(
+        "rpml.cli.simulate_income_paths",
+        lambda base_income, cfg: np.array([[100.0, 100.0, 100.0], [30.0, 30.0, 30.0]], dtype=float),
+    )
+    monkeypatch.setattr(
+        "rpml.cli.solve_rpml",
+        lambda scenario_instance, **kwargs: SimpleNamespace(
+            status="OPTIMAL",
+            objective_value=90.0,
+            solve_time=0.1,
+            gap=0.0,
+            payments=np.array([[0.0, 45.0, 45.0]], dtype=float),
+        ),
+    )
+    monkeypatch.setattr(
+        "rpml.cli.solve_stochastic_rpml",
+        lambda **kwargs: (
+            captured.__setitem__("shortfall_rate_beta", kwargs.get("shortfall_rate_beta")),
+            SimpleNamespace(
+                status="OPTIMAL",
+                total_payment_cost=95.0,
+                objective_value=96.0,
+                solve_time=0.2,
+                gap=0.0,
+                cash_shortfall_rate=0.5,
+                scenario_shortfalls=np.array([[0.0, 0.0, 0.0], [0.0, 10.0, 10.0]], dtype=float),
+                scenario_total_shortfalls=np.array([0.0, 20.0], dtype=float),
+            ),
+        )[1],
+    )
+
+    results = run_stochastic_cvar_experiments(
+        dataset_path=Path("/tmp/unused"),
+        mc_config=IncomeMCConfig(n_scenarios=2, seed=1),
+        risk_alpha=0.95,
+        risk_lambda=1.0,
+        shortfall_epsilon=1e-6,
+        shortfall_rate_beta=0.5,
+        max_instances_per_group=1,
+        verbose=False,
+        allowed_n_loans=(4,),
+    )
+
+    assert len(results) == 1
+    result = results[0]
+    assert result.instance_name == "inst_a"
+    assert result.n_scenarios == 2
+    assert result.stochastic_status == "OPTIMAL"
+    assert result.shortfall_rate_beta == 0.5
+    assert result.stochastic_cvar_shortfall >= 0.0
+    assert captured["shortfall_rate_beta"] == 0.5
+
+
+def test_process_stochastic_cvar_instance_returns_result(monkeypatch):
+    instance = SimpleNamespace(name="inst_a", n=4, monthly_income=np.array([100.0, 100.0]))
+    expected = StochasticRiskComparisonResult(
+        instance_name="inst_a",
+        n_loans=4,
+        n_scenarios=2,
+        risk_alpha=0.95,
+        risk_lambda=1.0,
+        shortfall_epsilon=1e-6,
+        shortfall_rate_beta=0.5,
+        deterministic_status="OPTIMAL",
+        deterministic_cost=90.0,
+        deterministic_solve_time=0.1,
+        deterministic_gap=0.0,
+        deterministic_mean_shortfall=10.0,
+        deterministic_median_shortfall=10.0,
+        deterministic_p90_shortfall=10.0,
+        deterministic_max_shortfall=10.0,
+        deterministic_cvar_shortfall=10.0,
+        deterministic_cash_shortfall_rate=0.5,
+        stochastic_status="OPTIMAL",
+        stochastic_total_payment_cost=95.0,
+        stochastic_objective_value=96.0,
+        stochastic_solve_time=0.2,
+        stochastic_gap=0.0,
+        stochastic_mean_shortfall=5.0,
+        stochastic_median_shortfall=5.0,
+        stochastic_p90_shortfall=5.0,
+        stochastic_max_shortfall=5.0,
+        stochastic_cvar_shortfall=5.0,
+        stochastic_cash_shortfall_rate=0.25,
+        delta_total_payment_cost=5.0,
+        delta_cvar_shortfall=-5.0,
+        delta_cash_shortfall_rate=-0.25,
+        deterministic_scenario_shortfalls=[10.0, 10.0],
+        stochastic_scenario_shortfalls=[0.0, 10.0],
+    )
+    monkeypatch.setattr("rpml.cli._build_stochastic_cvar_result", lambda **kwargs: expected)
+
+    result = process_stochastic_cvar_instance(
+        (
+            instance,
+            IncomeMCConfig(n_scenarios=2, seed=1),
+            0.95,
+            1.0,
+            1e-6,
+            0.5,
+            10,
+            DEFAULT_SOLVER,
+            False,
+        )
+    )
+
+    assert result[0] == "ok"
+    assert result[1] == expected
+
+
+def test_run_stochastic_cvar_experiments_parallel_returns_results(monkeypatch):
+    inst_b = SimpleNamespace(name="inst_b", n=4, monthly_income=np.array([100.0, 100.0]))
+    inst_a = SimpleNamespace(name="inst_a", n=4, monthly_income=np.array([100.0, 100.0]))
+    monkeypatch.setattr("rpml.cli.load_all_instances", lambda _: [inst_b, inst_a])
+    monkeypatch.setattr("rpml.cli.get_instances_by_size", lambda _: {4: [inst_b, inst_a]})
+
+    def _fake_worker(args_tuple):
+        inst = args_tuple[0]
+        result = StochasticRiskComparisonResult(
+            instance_name=inst.name,
+            n_loans=4,
+            n_scenarios=2,
+            risk_alpha=0.95,
+            risk_lambda=1.0,
+            shortfall_epsilon=1e-6,
+            shortfall_rate_beta=0.5,
+            deterministic_status="OPTIMAL",
+            deterministic_cost=90.0,
+            deterministic_solve_time=0.1,
+            deterministic_gap=0.0,
+            deterministic_mean_shortfall=10.0,
+            deterministic_median_shortfall=10.0,
+            deterministic_p90_shortfall=10.0,
+            deterministic_max_shortfall=10.0,
+            deterministic_cvar_shortfall=10.0,
+            deterministic_cash_shortfall_rate=0.5,
+            stochastic_status="OPTIMAL",
+            stochastic_total_payment_cost=95.0,
+            stochastic_objective_value=96.0,
+            stochastic_solve_time=0.2,
+            stochastic_gap=0.0,
+            stochastic_mean_shortfall=5.0,
+            stochastic_median_shortfall=5.0,
+            stochastic_p90_shortfall=5.0,
+            stochastic_max_shortfall=5.0,
+            stochastic_cvar_shortfall=5.0,
+            stochastic_cash_shortfall_rate=0.25,
+            delta_total_payment_cost=5.0,
+            delta_cvar_shortfall=-5.0,
+            delta_cash_shortfall_rate=-0.25,
+            deterministic_scenario_shortfalls=[10.0, 10.0],
+            stochastic_scenario_shortfalls=[0.0, 10.0],
+        )
+        return ("ok", result)
+
+    monkeypatch.setattr("rpml.cli.process_stochastic_cvar_instance", _fake_worker)
+
+    class _FakeFuture:
+        def __init__(self, value):
+            self._value = value
+
+        def result(self):
+            return self._value
+
+    class _FakeExecutor:
+        def __init__(self, max_workers=None):
+            self.max_workers = max_workers
+
+        def submit(self, fn, args):
+            return _FakeFuture(fn(args))
+
+        def shutdown(self, wait=False, cancel_futures=True):
+            return None
+
+    monkeypatch.setattr("rpml.cli.futures.ProcessPoolExecutor", _FakeExecutor)
+    monkeypatch.setattr("rpml.cli.futures.as_completed", lambda iterable: list(reversed(list(iterable))))
+
+    results = run_stochastic_cvar_experiments_parallel(
+        dataset_path=Path("/tmp/unused"),
+        mc_config=IncomeMCConfig(n_scenarios=2, seed=1),
+        risk_alpha=0.95,
+        risk_lambda=1.0,
+        shortfall_epsilon=1e-6,
+        shortfall_rate_beta=0.5,
+        max_instances_per_group=None,
+        verbose=False,
+        allowed_n_loans=(4,),
+        n_workers=2,
+    )
+
+    assert [item.instance_name for item in results] == ["inst_a", "inst_b"]
+
+
+def test_main_h2_parallel_uses_parallel_runner(monkeypatch, capsys, tmp_path):
+    dataset_path = tmp_path / "RiosSolisDataset" / "Instances" / "Instances"
+    dataset_path.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr("rpml.cli.PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(
+        "rpml.cli.parse_args",
+        lambda: Namespace(
+            checkpoint=None,
+            timeout_log=None,
+            timelines_dir=None,
+            scip=False,
+            summary=False,
+            max_instances=None,
+            n_loans=[4],
+            time_limit=1,
+            watchdog_grace_seconds=1,
+            parallel=True,
+            workers=2,
+            export_timelines=False,
+            mc_income=False,
+            mc_scenarios=2,
+            mc_seed=42,
+            mc_rho=0.55,
+            mc_sigma=0.15,
+            mc_shock_prob=0.04,
+            mc_shock_severity=0.30,
+            mc_output=None,
+            stochastic_cvar=True,
+            risk_alpha=0.95,
+            risk_lambda=1.0,
+            shortfall_epsilon=1e-6,
+            shortfall_rate_beta=0.5,
+            h2_output=None,
+            include_known_timeouts=False,
+            restart=False,
+        ),
+    )
+
+    def _sequential_should_not_be_called(**kwargs):
+        raise AssertionError("Sequential H2 runner must not be called when parallel=True")
+
+    monkeypatch.setattr("rpml.cli.run_stochastic_cvar_experiments", _sequential_should_not_be_called)
+
+    called = {"parallel": False}
+
+    def _parallel_runner(**kwargs):
+        called["parallel"] = True
+        return [
+            StochasticRiskComparisonResult(
+                instance_name="inst_a",
+                n_loans=4,
+                n_scenarios=2,
+                risk_alpha=0.95,
+                risk_lambda=1.0,
+                shortfall_epsilon=1e-6,
+                shortfall_rate_beta=0.5,
+                deterministic_status="OPTIMAL",
+                deterministic_cost=90.0,
+                deterministic_solve_time=0.1,
+                deterministic_gap=0.0,
+                deterministic_mean_shortfall=10.0,
+                deterministic_median_shortfall=10.0,
+                deterministic_p90_shortfall=10.0,
+                deterministic_max_shortfall=10.0,
+                deterministic_cvar_shortfall=10.0,
+                deterministic_cash_shortfall_rate=0.5,
+                stochastic_status="OPTIMAL",
+                stochastic_total_payment_cost=95.0,
+                stochastic_objective_value=96.0,
+                stochastic_solve_time=0.2,
+                stochastic_gap=0.0,
+                stochastic_mean_shortfall=5.0,
+                stochastic_median_shortfall=5.0,
+                stochastic_p90_shortfall=5.0,
+                stochastic_max_shortfall=5.0,
+                stochastic_cvar_shortfall=5.0,
+                stochastic_cash_shortfall_rate=0.25,
+                delta_total_payment_cost=5.0,
+                delta_cvar_shortfall=-5.0,
+                delta_cash_shortfall_rate=-0.25,
+                deterministic_scenario_shortfalls=[10.0, 10.0],
+                stochastic_scenario_shortfalls=[0.0, 10.0],
+            )
+        ]
+
+    monkeypatch.setattr("rpml.cli.run_stochastic_cvar_experiments_parallel", _parallel_runner)
+    monkeypatch.setattr(
+        "rpml.cli._write_h2_outputs",
+        lambda **kwargs: (
+            tmp_path / "tmp" / "stochastic_cvar_results.csv",
+            tmp_path / "tmp" / "stochastic_cvar_results_scenarios.csv",
+            tmp_path / "tmp" / "stochastic_cvar_results_meta.json",
+        ),
+    )
+
+    main()
+    out = capsys.readouterr().out
+
+    assert called["parallel"] is True
+    assert "STOCHASTIC CVAR SUMMARY" in out

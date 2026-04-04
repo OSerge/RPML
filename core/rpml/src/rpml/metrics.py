@@ -52,6 +52,77 @@ class MonteCarloAggregateResult:
     p95_required_budget_overrun_proxy: float
 
 
+@dataclass
+class StochasticRiskComparisonResult:
+    """Per-instance comparison: deterministic RPML vs stochastic CVaR RPML."""
+
+    instance_name: str
+    n_loans: int
+    n_scenarios: int
+    risk_alpha: float
+    risk_lambda: float
+    shortfall_epsilon: float
+    shortfall_rate_beta: float | None
+    deterministic_status: str
+    deterministic_cost: float
+    deterministic_solve_time: float
+    deterministic_gap: float
+    deterministic_mean_shortfall: float
+    deterministic_median_shortfall: float
+    deterministic_p90_shortfall: float
+    deterministic_max_shortfall: float
+    deterministic_cvar_shortfall: float
+    deterministic_cash_shortfall_rate: float
+    stochastic_status: str
+    stochastic_total_payment_cost: float
+    stochastic_objective_value: float
+    stochastic_solve_time: float
+    stochastic_gap: float
+    stochastic_mean_shortfall: float
+    stochastic_median_shortfall: float
+    stochastic_p90_shortfall: float
+    stochastic_max_shortfall: float
+    stochastic_cvar_shortfall: float
+    stochastic_cash_shortfall_rate: float
+    delta_total_payment_cost: float
+    delta_cvar_shortfall: float
+    delta_cash_shortfall_rate: float
+    deterministic_scenario_shortfalls: list[float]
+    stochastic_scenario_shortfalls: list[float]
+
+
+def compute_cvar(samples: np.ndarray | list[float], alpha: float = 0.95) -> float:
+    """Compute CVaR(alpha) for a loss sample."""
+    arr = np.asarray(samples, dtype=float)
+    if arr.ndim != 1 or arr.size == 0:
+        raise ValueError("samples must be a non-empty 1D array")
+    if not (0.0 < alpha < 1.0):
+        raise ValueError("alpha must be in (0, 1)")
+
+    try:
+        var_alpha = float(np.quantile(arr, alpha, method="lower"))
+    except TypeError:
+        var_alpha = float(np.quantile(arr, alpha, interpolation="lower"))
+    tail = arr[arr >= var_alpha]
+    if tail.size == 0:
+        tail = np.array([var_alpha], dtype=float)
+    return float(np.mean(tail))
+
+
+def compute_cash_shortfall_rate(
+    scenario_shortfalls: np.ndarray | list[float], epsilon: float = 1e-6
+) -> float:
+    """Share of scenarios with any meaningful shortfall."""
+    arr = np.asarray(scenario_shortfalls, dtype=float)
+    if arr.size == 0 or arr.ndim not in (1, 2):
+        raise ValueError("scenario_shortfalls must be a non-empty 1D or 2D array")
+    if epsilon < 0.0:
+        raise ValueError("epsilon must be >= 0")
+    if arr.ndim == 1:
+        return float(np.mean(arr > epsilon))
+    return float(np.mean(np.any(arr > epsilon, axis=1)))
+
+
 def relative_savings(optimal_cost: float, baseline_cost: float) -> Optional[float]:
     """
     Calculate relative savings percentage (MILP vs baseline).
@@ -561,6 +632,63 @@ def print_summary(results: list[ComparisonResult]):
     print("\nProblem cases:")
     print("  FEASIBLE instances: " + _format_problem_list(agg["feasible_instances"]))
     print("  NOT_SOLVED instances: " + _format_problem_list(agg["not_solved_instances"]))
+
+    print("\n" + "=" * 60)
+
+
+def print_stochastic_risk_summary(results: list[StochasticRiskComparisonResult]) -> None:
+    """Print summary for stochastic CVaR experiment results."""
+    if not results:
+        print("No stochastic CVaR results to summarize.")
+        return
+
+    def _finite(values: list[float]) -> np.ndarray:
+        arr = np.array(values, dtype=float)
+        return arr[np.isfinite(arr)]
+
+    total = len(results)
+    stoch_optimal = sum(1 for r in results if r.stochastic_status in ("OPTIMAL", "FEASIBLE"))
+    det_optimal = sum(1 for r in results if r.deterministic_status in ("OPTIMAL", "FEASIBLE"))
+    beta_values = sorted(
+        {
+            float(r.shortfall_rate_beta)
+            for r in results
+            if r.shortfall_rate_beta is not None
+        }
+    )
+
+    delta_cost = _finite([r.delta_total_payment_cost for r in results])
+    delta_cvar = _finite([r.delta_cvar_shortfall for r in results])
+    delta_rate = _finite([r.delta_cash_shortfall_rate for r in results])
+
+    print("=" * 60)
+    print("STOCHASTIC CVAR EXPERIMENT SUMMARY")
+    print("=" * 60)
+    print(f"\nTotal base instances: {total}")
+    print(f"Deterministic usable coverage: {det_optimal}/{total} ({100.0 * det_optimal / total:.1f}%)")
+    print(f"Stochastic usable coverage: {stoch_optimal}/{total} ({100.0 * stoch_optimal / total:.1f}%)")
+    if beta_values:
+        if len(beta_values) == 1:
+            print(f"Shortfall rate beta: {beta_values[0]:.6f}")
+        else:
+            print("Shortfall rate beta values: " + ", ".join(f"{value:.6f}" for value in beta_values))
+
+    if delta_cvar.size > 0:
+        print(
+            "Delta CVaR shortfall (stochastic - deterministic): "
+            f"avg {float(np.mean(delta_cvar)):.4f}, median {float(np.median(delta_cvar)):.4f}, "
+            f"p90 {float(np.percentile(delta_cvar, 90)):.4f}"
+        )
+    if delta_rate.size > 0:
+        print(
+            "Delta Cash Shortfall Rate (stochastic - deterministic): "
+            f"avg {float(np.mean(delta_rate)):.6f}, median {float(np.median(delta_rate)):.6f}"
+        )
+    if delta_cost.size > 0:
+        print(
+            "Delta total payment cost (stochastic - deterministic): "
+            f"avg {float(np.mean(delta_cost)):.2f}, median {float(np.median(delta_cost)):.2f}"
+        )
 
     print("\n" + "=" * 60)
 

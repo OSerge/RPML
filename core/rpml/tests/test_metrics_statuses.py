@@ -7,6 +7,8 @@ from rpml.metrics import (
     ComparisonResult,
     aggregate_results,
     compare_solutions,
+    compute_cash_shortfall_rate,
+    compute_cvar,
     print_summary,
     validate_baseline_solution,
 )
@@ -226,3 +228,18 @@ def test_print_summary_reports_status_split(capsys):
     assert "8 loans" in out
     assert "Problem cases:" in out
     assert "FEASIBLE instances: feas-1 (24.00s, gap 2.00%)" in out
+
+
+def test_compute_cvar_matches_manual_tail_average():
+    samples = np.array([0.0, 1.0, 2.0, 3.0, 10.0], dtype=float)
+    cvar = compute_cvar(samples, alpha=0.8)
+
+    # VaR_0.8 = 3.0 => tail = [3.0, 10.0], mean = 6.5
+    assert cvar == pytest.approx(6.5)
+
+
+def test_compute_cash_shortfall_rate_counts_positive_events():
+    shortfalls = np.array([0.0, 0.0, 1e-7, 0.02, 1.5], dtype=float)
+    rate = compute_cash_shortfall_rate(shortfalls, epsilon=1e-6)
+
+    assert rate == pytest.approx(2 / 5)
