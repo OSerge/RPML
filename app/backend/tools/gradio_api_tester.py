@@ -14,6 +14,7 @@ class ApiSession:
     last_task_id: str = ""
     last_plan_id: str = ""
     last_debt_id: str = ""
+    last_horizon_months: int = 12
 
     @property
     def auth_headers(self) -> dict[str, str]:
@@ -78,6 +79,7 @@ def _build_sync_kpi(body: object) -> dict:
         "ru_mode": body.get("ru_mode"),
         "mc_income": body.get("mc_income"),
         "has_mc_summary": body.get("mc_summary") is not None,
+        "budget_policy": body.get("budget_policy"),
     }
     mc_summary = body.get("mc_summary")
     base_total_cost = body.get("total_cost")
@@ -98,6 +100,125 @@ def _build_sync_kpi(body: object) -> dict:
     return kpi
 
 
+def _format_money(value: float | int | None) -> str:
+    if value is None:
+        return "n/a"
+    return f"{float(value):,.0f}".replace(",", " ")
+
+
+def _build_sync_human_summary(body: object) -> str:
+    if not isinstance(body, dict):
+        return "### Краткие выводы\nНет данных для интерпретации."
+
+    status = body.get("status")
+    horizon = int(body.get("horizon_months") or 0)
+    total_cost = body.get("total_cost")
+    budget_policy = body.get("budget_policy")
+    savings_vector = body.get("savings_vector")
+    payments = body.get("payments_matrix")
+    if not isinstance(payments, list) or not payments:
+        return "### Краткие выводы\nНе удалось построить график платежей."
+
+    n_loans = len(payments)
+    month_count = max((len(row) for row in payments if isinstance(row, list)), default=0)
+    month_totals: list[float] = []
+    for month_idx in range(month_count):
+        month_total = 0.0
+        for row in payments:
+            if isinstance(row, list) and month_idx < len(row):
+                month_total += float(row[month_idx] or 0.0)
+        month_totals.append(month_total)
+
+    active = [v for v in month_totals if v > 1e-6]
+    first_active_month = next((i + 1 for i, v in enumerate(month_totals) if v > 1e-6), None)
+    last_active_month = next((i + 1 for i, v in reversed(list(enumerate(month_totals))) if v > 1e-6), None)
+    peak_payment = max(month_totals) if month_totals else 0.0
+    peak_month = (month_totals.index(peak_payment) + 1) if month_totals else None
+    avg_active_payment = (sum(active) / len(active)) if active else 0.0
+
+    budget_trace = body.get("budget_trace")
+    schedule_lines = []
+    if isinstance(budget_trace, list) and budget_trace:
+        first_window = min(12, len(budget_trace))
+        for row in budget_trace[:first_window]:
+            if not isinstance(row, dict):
+                continue
+            month = int(row.get("month", 0))
+            paid = _format_money(row.get("paid_total"))
+            available = _format_money(row.get("available_budget"))
+            carry_out = _format_money(row.get("carry_out"))
+            schedule_lines.append(
+                f"- M{month:02d}: платить {paid} (доступно {available}, перенос в след. мес. {carry_out})"
+            )
+    else:
+        first_window = min(12, len(month_totals))
+        for i in range(first_window):
+            schedule_lines.append(f"- M{i+1:02d}: {_format_money(month_totals[i])}")
+
+    mc_summary = body.get("mc_summary")
+    reserve_line = "- Внешний риск-буфер: не рассчитан (MC выключен)."
+    internal_reserve_line = "- Расчетный резерв по базовому плану: не формируется, весь доступный бюджет уходит в платежи."
+    if isinstance(savings_vector, list) and savings_vector:
+        positive = [(idx + 1, float(val)) for idx, val in enumerate(savings_vector) if float(val) > 1e-6]
+        if positive:
+            peak_reserve_month, peak_reserve = max(positive, key=lambda item: item[1])
+            internal_reserve_line = (
+                f"- Расчетный резерв по базовому плану формируется. "
+                f"Максимум: {_format_money(peak_reserve)} в месяце M{peak_reserve_month}."
+            )
+    if isinstance(mc_summary, dict):
+        p90_total = mc_summary.get("p90_total_cost")
+        mean_total = mc_summary.get("mean_total_cost")
+        reserve_target = None
+        if isinstance(total_cost, (int, float)) and isinstance(p90_total, (int, float)):
+            reserve_target = max(float(p90_total) - float(total_cost), 0.0)
+        if reserve_target is not None:
+            monthly_reserve = reserve_target / max(horizon, 1)
+            reserve_line = (
+                f"- Внешний риск-буфер на случай плохих MC-сценариев: {_format_money(reserve_target)} "
+                f"(если копить равномерно: ≈ {_format_money(monthly_reserve)} в месяц на горизонте {horizon})."
+            )
+        reserve_line += (
+            f"\n- MC средняя стоимость: {_format_money(mean_total)}; "
+            f"MC p90 стоимость: {_format_money(p90_total)}."
+        )
+
+    lines = [
+        "### Краткие выводы",
+        f"- Статус плана: `{status}`.",
+        f"- Общая стоимость базового плана: **{_format_money(total_cost)}**.",
+        f"- Бюджетная политика: `{budget_policy}`.",
+        f"- Количество кредитов в плане: {n_loans}.",
+        (
+            f"- Окно активных платежей: M{first_active_month}..M{last_active_month}."
+            if first_active_month is not None and last_active_month is not None
+            else "- Активные платежи не найдены."
+        ),
+        f"- Средний платеж в активные месяцы: {_format_money(avg_active_payment)}.",
+        (
+            f"- Пиковый платеж: {_format_money(peak_payment)} в месяце M{peak_month}."
+            if peak_month is not None
+            else "- Пиковый платеж: n/a."
+        ),
+        internal_reserve_line,
+        reserve_line,
+        "",
+        "### Сколько тратить по месяцам (первые 12)",
+        *schedule_lines,
+    ]
+    return "\n".join(lines)
+
+
+def _parse_income_vector(raw: str) -> list[float]:
+    stripped = raw.strip()
+    if not stripped:
+        return []
+    parsed = json.loads(stripped)
+    if not isinstance(parsed, list):
+        raise ValueError("monthly_income_vector must be JSON array")
+    return [float(x) for x in parsed]
+
+
 def login(base_url: str, email: str, password: str, state: ApiSession):
     normalized = _normalize_base_url(base_url)
     payload = {"email": email, "password": password}
@@ -109,6 +230,90 @@ def login(base_url: str, email: str, password: str, state: ApiSession):
         state.token = body["access_token"]
         return state, "Успешный вход", _pretty(body)
     return state, f"Ошибка входа: HTTP {response.status_code}", _pretty(body)
+
+
+def get_scenario_profile(base_url: str, state: ApiSession):
+    normalized = _normalize_base_url(base_url)
+    with httpx.Client(timeout=30.0) as client:
+        response = client.get(
+            f"{normalized}/api/v1/scenario/profile",
+            headers=state.auth_headers,
+        )
+    body = _json_or_text(response)
+    vector_raw = "[]"
+    horizon = state.last_horizon_months
+    if response.status_code == 200 and isinstance(body, dict):
+        horizon = int(body.get("horizon_months", horizon))
+        state.last_horizon_months = horizon
+        vector_raw = _pretty(body.get("monthly_income_vector", []))
+    return state, _pretty({"http_status": response.status_code, "body": body}), horizon, vector_raw
+
+
+def update_scenario_profile(
+    base_url: str,
+    horizon_months: int,
+    monthly_income_vector_raw: str,
+    state: ApiSession,
+):
+    normalized = _normalize_base_url(base_url)
+    try:
+        vector = _parse_income_vector(monthly_income_vector_raw)
+    except Exception as exc:
+        return state, _pretty({"error": str(exc)}), horizon_months, monthly_income_vector_raw
+
+    payload = {
+        "horizon_months": int(horizon_months),
+        "monthly_income_vector": vector,
+    }
+    with httpx.Client(timeout=30.0) as client:
+        response = client.put(
+            f"{normalized}/api/v1/scenario/profile",
+            headers=state.auth_headers,
+            json=payload,
+        )
+    body = _json_or_text(response)
+    out_horizon = int(horizon_months)
+    out_vector_raw = monthly_income_vector_raw
+    if response.status_code == 200 and isinstance(body, dict):
+        out_horizon = int(body.get("horizon_months", out_horizon))
+        state.last_horizon_months = out_horizon
+        out_vector_raw = _pretty(body.get("monthly_income_vector", []))
+    return state, _pretty({"http_status": response.status_code, "body": body}), out_horizon, out_vector_raw
+
+
+def estimate_available_budget(
+    base_url: str,
+    horizon_months: int,
+    monthly_income: float,
+    mandatory_expenses: float,
+    variable_expenses: float,
+    safety_buffer_pct: float,
+    state: ApiSession,
+):
+    normalized = _normalize_base_url(base_url)
+    payload = {
+        "horizon_months": int(horizon_months),
+        "monthly_income": float(monthly_income),
+        "mandatory_expenses": float(mandatory_expenses),
+        "variable_expenses": float(variable_expenses),
+        "safety_buffer_pct": float(safety_buffer_pct),
+    }
+    with httpx.Client(timeout=30.0) as client:
+        response = client.post(
+            f"{normalized}/api/v1/scenario/profile/estimate-available-budget",
+            headers=state.auth_headers,
+            json=payload,
+        )
+    body = _json_or_text(response)
+    vector_raw = "[]"
+    out_horizon = int(horizon_months)
+    if response.status_code == 200 and isinstance(body, dict):
+        profile = body.get("scenario_profile", {})
+        if isinstance(profile, dict):
+            out_horizon = int(profile.get("horizon_months", out_horizon))
+            state.last_horizon_months = out_horizon
+            vector_raw = _pretty(profile.get("monthly_income_vector", []))
+    return state, _pretty({"http_status": response.status_code, "body": body}), out_horizon, vector_raw
 
 
 def run_sync(base_url: str, horizon_months: int, ru_mode: bool, mc_income: bool, state: ApiSession):
@@ -127,8 +332,14 @@ def run_sync(base_url: str, horizon_months: int, ru_mode: bool, mc_income: bool,
     body = _json_or_text(response)
     if response.status_code == 200:
         kpi = _build_sync_kpi(body)
-        return _pretty(kpi), _pretty(body)
-    return _pretty({"http_status": response.status_code}), _pretty(body)
+        insights = _build_sync_human_summary(body)
+        return _pretty(kpi), _pretty(body), _pretty(body.get("budget_trace", [])), insights
+    return (
+        _pretty({"http_status": response.status_code}),
+        _pretty(body),
+        _pretty([]),
+        "### Краткие выводы\nРасчет не выполнен. Проверьте входные параметры и профиль дохода.",
+    )
 
 
 def create_async_task(
@@ -391,11 +602,57 @@ def build_app() -> gr.Blocks:
             mc_income_sync = gr.Checkbox(value=False, label="mc_income")
             sync_btn = gr.Button("Run sync optimization")
             sync_kpi = gr.Code(label="KPI", language="json")
+            sync_budget_trace = gr.Code(label="Budget Trace", language="json")
+            sync_insights = gr.Markdown("### Краткие выводы\nЗапустите расчет, чтобы получить интерпретацию.")
             sync_response = gr.Code(label="Response JSON", language="json")
             sync_btn.click(
                 run_sync,
                 inputs=[base_url_sync, horizon_sync, ru_mode_sync, mc_income_sync, state],
-                outputs=[sync_kpi, sync_response],
+                outputs=[sync_kpi, sync_response, sync_budget_trace, sync_insights],
+            )
+
+        with gr.Tab("Scenario / Income"):
+            base_url_scenario = gr.Textbox(value="http://127.0.0.1:8000", label="Base URL")
+            horizon_scenario = gr.Slider(minimum=1, maximum=240, value=12, step=1, label="Horizon months")
+            monthly_income_vector = gr.Code(
+                label="monthly_income_vector (JSON array)",
+                value="[50000.0, 50000.0, 50000.0, 50000.0, 50000.0, 50000.0, 50000.0, 50000.0, 50000.0, 50000.0, 50000.0, 50000.0]",
+                language="json",
+            )
+            with gr.Row():
+                get_profile_btn = gr.Button("Get profile")
+                update_profile_btn = gr.Button("Update profile vector")
+            gr.Markdown("### Быстрая оценка доступного бюджета")
+            with gr.Row():
+                monthly_income = gr.Number(value=120000.0, label="monthly_income")
+                mandatory_expenses = gr.Number(value=70000.0, label="mandatory_expenses")
+                variable_expenses = gr.Number(value=10000.0, label="variable_expenses")
+                safety_buffer_pct = gr.Number(value=0.1, label="safety_buffer_pct")
+            estimate_btn = gr.Button("Estimate and save available budget")
+            scenario_response = gr.Code(label="Scenario response", language="json")
+
+            get_profile_btn.click(
+                get_scenario_profile,
+                inputs=[base_url_scenario, state],
+                outputs=[state, scenario_response, horizon_scenario, monthly_income_vector],
+            )
+            update_profile_btn.click(
+                update_scenario_profile,
+                inputs=[base_url_scenario, horizon_scenario, monthly_income_vector, state],
+                outputs=[state, scenario_response, horizon_scenario, monthly_income_vector],
+            )
+            estimate_btn.click(
+                estimate_available_budget,
+                inputs=[
+                    base_url_scenario,
+                    horizon_scenario,
+                    monthly_income,
+                    mandatory_expenses,
+                    variable_expenses,
+                    safety_buffer_pct,
+                    state,
+                ],
+                outputs=[state, scenario_response, horizon_scenario, monthly_income_vector],
             )
 
         with gr.Tab("Async task"):

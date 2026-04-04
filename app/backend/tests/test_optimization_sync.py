@@ -22,6 +22,25 @@ def test_sync_optimization_returns_plan(client, auth_headers, seeded_debts):
     assert body["input_mode"] == "scenario_snapshot"
     assert isinstance(body["assumptions"], list)
     assert len(body["assumptions"]) >= 1
+    assert isinstance(body["savings_vector"], list)
+    assert body["budget_policy"] == "starts_next_month_with_carryover"
+    assert isinstance(body["budget_trace"], list)
+
+
+def test_budget_trace_starts_income_from_next_month(client, auth_headers, seeded_debts):
+    res = client.post(
+        "/api/v1/optimization/run",
+        headers=auth_headers,
+        json={"horizon_months": 12},
+    )
+    assert res.status_code == 200
+    trace = res.json()["budget_trace"]
+    assert len(trace) == 12
+    assert trace[0]["month"] == 1
+    assert trace[0]["income_in"] == 0.0
+    assert trace[0]["reserve_start"] == 0.0
+    assert trace[1]["month"] == 2
+    assert trace[1]["income_in"] == 5000.0
 
 
 def test_optimization_no_debts_returns_400(client, auth_headers):
@@ -207,6 +226,40 @@ def test_sync_optimization_normalizes_numeric_noise_in_matrices(client, auth_hea
     assert body["payments_matrix"][0][1] == 0.0
     assert body["balances_matrix"][1][2] == 0.0
     assert body["baseline_comparison"]["strategy_results"]["milp"]["payments_matrix"][0][1] == 0.0
+
+
+def test_budget_trace_exposes_implied_reserve_from_plan(client, auth_headers, seeded_debts, monkeypatch):
+    def fake_run(self, instance, *, time_limit_seconds=None, ru_mode=True):
+        n, t = instance.n, instance.T
+        payments = np.zeros((n, t), dtype=float)
+        balances = np.zeros((n, t), dtype=float)
+        if t >= 2:
+            payments[:, 1] = [50.0] * n
+        return RPMLSolution(
+            payments=payments,
+            balances=balances,
+            savings=np.zeros(t, dtype=float),
+            active_loans=np.zeros((n, t)),
+            objective_value=float(np.sum(payments)),
+            solve_time=0.0,
+            gap=0.0,
+            status="OPTIMAL",
+        )
+
+    monkeypatch.setattr(
+        "server.application.use_cases.run_optimization_sync.RpmlAdapter.run",
+        fake_run,
+    )
+    res = client.post(
+        "/api/v1/optimization/run",
+        headers=auth_headers,
+        json={"horizon_months": 12},
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert body["savings_vector"][1] == 4900.0
+    assert body["budget_trace"][1]["reserve_end"] == 4900.0
+    assert body["budget_trace"][1]["carry_out"] == 4900.0
 
 
 def test_sync_optimization_ignores_stale_source_json_lengths(client, auth_headers, seeded_debts, db_session):
