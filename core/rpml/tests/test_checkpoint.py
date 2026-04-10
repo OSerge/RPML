@@ -114,6 +114,19 @@ def test_export_to_csv():
         assert "csv_test" in content
 
 
+def test_export_to_csv_creates_missing_parent_directory():
+    """export_to_csv creates parent directories for the target CSV path."""
+    with tempfile.TemporaryDirectory() as d:
+        ck_path = Path(d) / "ck.jsonl"
+        csv_path = Path(d) / "exports" / "out.csv"
+        mgr = CheckpointManager(ck_path)
+        mgr.save_result(_sample_result("csv_nested"))
+        mgr.export_to_csv(csv_path)
+        assert csv_path.exists()
+        content = csv_path.read_text(encoding="utf-8")
+        assert "csv_nested" in content
+
+
 def test_export_to_csv_empty_checkpoint():
     """export_to_csv on empty checkpoint does not create file with data."""
     with tempfile.TemporaryDirectory() as d:

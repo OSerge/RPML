@@ -143,6 +143,8 @@ class CheckpointManager:
         results = list(self.load_existing_results().values())
         if not results:
             return
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
         rows = [
             {
                 "instance": r.instance_name,
