@@ -262,6 +262,46 @@ def test_budget_trace_exposes_implied_reserve_from_plan(client, auth_headers, se
     assert body["budget_trace"][1]["carry_out"] == 4900.0
 
 
+def test_budget_trace_exposes_implied_penalty_from_balance_dynamics(
+    client,
+    auth_headers,
+    seeded_debts,
+    monkeypatch,
+):
+    def fake_run(self, instance, *, time_limit_seconds=None, ru_mode=True):
+        n, t = instance.n, instance.T
+        payments = np.zeros((n, t), dtype=float)
+        balances = np.zeros((n, t), dtype=float)
+        if t >= 2:
+            rate = float(instance.interest_rates[0, 1])
+            payments[0, 1] = 10.0
+            balances[0, 0] = 100.0
+            balances[0, 1] = 95.0 + 100.0 * rate
+        return RPMLSolution(
+            payments=payments,
+            balances=balances,
+            savings=np.zeros(t, dtype=float),
+            active_loans=np.zeros((n, t)),
+            objective_value=float(np.sum(payments)),
+            solve_time=0.0,
+            gap=0.0,
+            status="OPTIMAL",
+        )
+
+    monkeypatch.setattr(
+        "server.application.use_cases.run_optimization_sync.RpmlAdapter.run",
+        fake_run,
+    )
+    res = client.post(
+        "/api/v1/optimization/run",
+        headers=auth_headers,
+        json={"horizon_months": 12},
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert body["budget_trace"][1]["implied_penalty"] == 5.0
+
+
 def test_sync_optimization_ignores_stale_source_json_lengths(client, auth_headers, seeded_debts, db_session):
     profile = db_session.scalar(select(ScenarioProfileORM))
     assert profile is not None

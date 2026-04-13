@@ -224,3 +224,74 @@ def test_demo_seed_replaces_legacy_unprefixed_demo_debts(client, auth_headers, d
         for row in db_session.scalars(select(DebtORM).where(DebtORM.user_id == demo_user.id)).all()
     }
     assert all(name not in names for name in {"loan_0", "loan_1", "loan_2", "loan_3"})
+
+
+def test_demo_run_top_savings_returns_sorted_rows(client, auth_headers, tmp_path, monkeypatch):
+    from server.api.v1 import demo as demo_api
+
+    run_id = "20260406-211020_base_std_n4_tl300_m110_b0327b96"
+    checkpoint_dir = tmp_path / "core" / "rpml" / "tmp" / "runs" / run_id / "checkpoint"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = checkpoint_dir / "experiment_results_checkpoint.jsonl"
+    checkpoint_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "instance_name": "inst_a",
+                        "optimal_cost": 100.0,
+                        "avalanche_cost": 200.0,
+                        "avalanche_savings": 50.0,
+                        "optimal_status": "OPTIMAL",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "instance_name": "inst_b",
+                        "optimal_cost": 100.0,
+                        "avalanche_cost": 125.0,
+                        "avalanche_savings": 20.0,
+                        "optimal_status": "OPTIMAL",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "instance_name": "inst_c",
+                        "optimal_cost": 100.0,
+                        "avalanche_cost": 110.0,
+                        "avalanche_savings": 9.0,
+                        "optimal_status": "FEASIBLE",
+                    }
+                ),
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(demo_api, "_repo_root", lambda: tmp_path)
+
+    response = client.get(
+        f"/api/v1/demo/runs/{run_id}/top-savings?metric=avalanche&limit=2",
+        headers=auth_headers,
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["run_id"] == run_id
+    assert body["metric"] == "avalanche"
+    assert body["total_instances"] == 3
+    assert [row["instance_name"] for row in body["items"]] == ["inst_a", "inst_b"]
+
+
+def test_demo_run_top_savings_404_when_run_missing(client, auth_headers):
+    response = client.get(
+        "/api/v1/demo/runs/missing-run/top-savings",
+        headers=auth_headers,
+    )
+    assert response.status_code == 404
+
+
+def test_demo_run_top_savings_rejects_invalid_run_id(client, auth_headers):
+    response = client.get(
+        "/api/v1/demo/runs/bad$run/top-savings",
+        headers=auth_headers,
+    )
+    assert response.status_code == 422

@@ -40,13 +40,11 @@ build/
 .DS_Store
 Thumbs.db
 
-
-
-.pytest_cache/
-
 # Project specific
-
+.codex
+.cursor/
 tmp/
+.run/
 *.aux
 *.log
 *.out
@@ -61,3 +59,5 @@ tmp/
 *.lof
 
 reports/
+.worktrees/
+app/frontend/

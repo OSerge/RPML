@@ -23,6 +23,7 @@ def migrated_engine(tmp_path, monkeypatch):
     backend_root = Path(__file__).resolve().parent.parent
     cfg = Config(str(backend_root / "alembic.ini"))
     cfg.set_main_option("sqlalchemy.url", url)
+    cfg.set_main_option("script_location", str((backend_root / "alembic").resolve()))
     command.upgrade(cfg, "head")
 
     engine = create_engine(

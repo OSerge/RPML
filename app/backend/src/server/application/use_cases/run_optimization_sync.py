@@ -126,13 +126,48 @@ def _build_implied_savings_vector(
     return savings.tolist()
 
 
+def _build_implied_penalties_vector(
+    instance,
+    payments_matrix: list[list[float]],
+    balances_matrix: list[list[float]],
+) -> list[float]:
+    balances = np.asarray(balances_matrix, dtype=float)
+    payments = np.asarray(payments_matrix, dtype=float)
+    if balances.ndim != 2 or payments.ndim != 2:
+        return []
+    n_loans = int(instance.n)
+    horizon = int(instance.T)
+    if balances.shape[0] < n_loans or payments.shape[0] < n_loans:
+        return []
+    penalties = np.zeros(horizon, dtype=float)
+    for j in range(n_loans):
+        release = int(instance.release_time[j])
+        for t in range(horizon):
+            if t <= release:
+                continue
+            prev_balance = float(balances[j, t - 1])
+            curr_balance = float(balances[j, t])
+            payment = float(payments[j, t])
+            rate = float(instance.interest_rates[j, t])
+            penalty = curr_balance - prev_balance * (1.0 + rate) + payment
+            if penalty > NUMERIC_NOISE_EPS:
+                penalties[t] += penalty
+    penalties = np.where(np.abs(penalties) < NUMERIC_NOISE_EPS, 0.0, penalties)
+    return penalties.tolist()
+
+
 def _build_budget_trace(
     payments_matrix: list[list[float]],
     monthly_income: np.ndarray,
     savings_vector: list[float],
+    implied_penalties_vector: list[float] | None = None,
 ) -> list[dict]:
     income = np.asarray(monthly_income, dtype=float)
     savings = np.asarray(savings_vector, dtype=float)
+    implied_penalties = np.asarray(
+        implied_penalties_vector if implied_penalties_vector is not None else [],
+        dtype=float,
+    )
     if income.ndim != 1:
         return []
     horizon = int(income.shape[0])
@@ -160,6 +195,11 @@ def _build_budget_trace(
                 "available_budget": available_budget,
                 "planned_payment": paid_total,
                 "paid_total": paid_total,
+                "implied_penalty": (
+                    float(implied_penalties[idx])
+                    if idx < implied_penalties.shape[0]
+                    else 0.0
+                ),
                 "reserve_end": carry_out,
                 "carry_out": carry_out,
                 "utilization_pct": utilization_pct,
@@ -308,6 +348,11 @@ def execute_run_optimization_sync(
     payments_matrix = _normalize_matrix(solution.payments)
     balances_matrix = _normalize_matrix(solution.balances)
     savings_vector = _build_implied_savings_vector(payments_matrix, instance.monthly_income)
+    implied_penalties_vector = _build_implied_penalties_vector(
+        instance,
+        payments_matrix,
+        balances_matrix,
+    )
     baseline_comparison = _build_baseline_comparison(
         instance,
         obj,
@@ -317,7 +362,12 @@ def execute_run_optimization_sync(
         ru_mode=ru_mode,
     )
     mc_summary = _build_monte_carlo_summary(instance, ru_mode=ru_mode) if mc_income else None
-    budget_trace = _build_budget_trace(payments_matrix, instance.monthly_income, savings_vector)
+    budget_trace = _build_budget_trace(
+        payments_matrix,
+        instance.monthly_income,
+        savings_vector,
+        implied_penalties_vector,
+    )
     result_json = {
         "status": solution.status,
         "total_cost": obj,
@@ -327,6 +377,7 @@ def execute_run_optimization_sync(
         "horizon_months": horizon_months,
         "ru_mode": ru_mode,
         "mc_income": mc_income,
+        "implied_penalties_vector": implied_penalties_vector,
         "mc_summary": mc_summary,
         "budget_policy": BUDGET_POLICY,
         "budget_trace": budget_trace,
