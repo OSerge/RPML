@@ -116,8 +116,8 @@ def test_source_json_vector_length_mismatch_is_ignored_for_solver_instance() -> 
     np.testing.assert_array_equal(inst.principals, np.array([1.0, 2.0]))
 
 
-def test_non_canonical_debt_order_raises() -> None:
-    """Cars must precede bank loans in id order (Rios-Solis indexing)."""
+def test_non_canonical_debt_order_is_canonicalized() -> None:
+    """Builder reorders debts to canonical RPML groups instead of rejecting insertion order."""
     debts = [
         DebtORM(
             id=1,
@@ -164,8 +164,10 @@ def test_non_canonical_debt_order_raises() -> None:
         },
         baseline_reference=None,
     )
-    with pytest.raises(OptimizationInstanceError, match="canonical"):
-        build_rios_solis_instance(debts, profile, horizon_months=3, user_id=1)
+    inst = build_rios_solis_instance(debts, profile, horizon_months=3, user_id=1)
+    np.testing.assert_array_equal(inst.principals, np.array([50.0, 100.0]))
+    assert inst.n_cars == 1
+    assert inst.n_bank_loans == 1
 
 
 def test_unsupported_loan_type_raises() -> None:

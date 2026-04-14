@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from sqlalchemy import ForeignKey, Integer, String, Text
+from sqlalchemy import ForeignKey, Integer, JSON, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from server.infrastructure.db.base import Base
@@ -17,8 +17,15 @@ class OptimizationTaskORM(Base):
     )
     status: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
     horizon_months: Mapped[int] = mapped_column(Integer, nullable=False)
+    input_mode: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        default="scenario_snapshot",
+    )
+    instance_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     ru_mode: Mapped[bool] = mapped_column(default=True, nullable=False)
     mc_income: Mapped[bool] = mapped_column(default=False, nullable=False)
+    mc_config_json: Mapped[dict | list | None] = mapped_column(JSON, nullable=True)
     plan_id: Mapped[str | None] = mapped_column(
         String(36),
         ForeignKey("optimization_plans.id", ondelete="SET NULL"),

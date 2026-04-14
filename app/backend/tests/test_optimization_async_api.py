@@ -4,6 +4,14 @@ import pytest
 from rpml.milp_model import RPMLSolution
 import numpy as np
 
+from server.services.dataset_instances import list_dataset_instances
+
+
+def _dataset_instance_name() -> str:
+    items = list_dataset_instances()
+    assert items
+    return items[0].name
+
 
 def test_create_async_task_returns_task_id(client, auth_headers, seeded_debts):
     res = client.post(
@@ -112,3 +120,33 @@ def test_create_async_task_requires_auth(client, seeded_debts):
         json={"horizon_months": 12},
     )
     assert res.status_code == 401
+
+
+def test_create_async_task_accepts_dataset_instance_without_snapshot(client, auth_headers):
+    instance_name = _dataset_instance_name()
+    res = client.post(
+        "/api/v1/optimization/tasks",
+        headers=auth_headers,
+        json={
+            "input_mode": "dataset_instance",
+            "instance_name": instance_name,
+            "ru_mode": True,
+            "mc_income": False,
+        },
+    )
+    assert res.status_code == 202
+    body = res.json()
+    assert body["status"] == "pending"
+    assert body["input_mode"] == "dataset_instance"
+    assert body["instance_name"] == instance_name
+    assert body["horizon_months"] in (120, 300)
+
+    status_res = client.get(
+        f"/api/v1/optimization/tasks/{body['task_id']}",
+        headers=auth_headers,
+    )
+    assert status_res.status_code == 200
+    status_body = status_res.json()
+    assert status_body["status"] == "completed"
+    assert status_body["input_mode"] == "dataset_instance"
+    assert status_body["instance_name"] == instance_name

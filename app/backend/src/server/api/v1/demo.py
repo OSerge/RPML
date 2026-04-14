@@ -11,7 +11,12 @@ from sqlalchemy.orm import Session
 from server.api.deps import get_current_user
 from server.domain.models.user import UserRead
 from server.infrastructure.db.session import get_db
-from server.services.demo_seed import DemoSeedValidationError, seed_demo_scenario
+from server.services.demo_seed import (
+    DemoSeedScenarioNotFoundError,
+    DemoSeedValidationError,
+    list_bundled_demo_instances,
+    seed_demo_scenario,
+)
 
 router = APIRouter()
 
@@ -38,6 +43,34 @@ class DemoRunTopSavingsResponse(BaseModel):
     checkpoint_path: str
     total_instances: int
     items: list[DemoRunTopSavingsItem]
+
+
+class DemoSeedRequest(BaseModel):
+    scenario_code: str | None = Field(
+        default=None,
+        description=(
+            "Код bundled demo-сценария из `/api/v1/demo/instances`. "
+            "Если не указан, используется стандартный demo-инстанс."
+        ),
+    )
+
+
+class DemoSeedResponse(BaseModel):
+    ok: bool
+    scenario_code: str
+    debts_count: int
+
+
+class DemoInstanceSummary(BaseModel):
+    code: str = Field(description="Код сценария, который сохраняется в `scenario_profiles.code`.")
+    source_file: str = Field(description="Имя bundled JSON-файла в `core/rpml/result_samples`.")
+    horizon_months: int = Field(description="Горизонт сценария в месяцах.")
+    loans_count: int = Field(description="Количество долгов в bundled сценарии.")
+    has_dat_file: bool = Field(description="Есть ли рядом исходный `.dat` с реальными ставками.")
+    available_baselines: list[str] = Field(
+        default_factory=list,
+        description="Baseline-стратегии, присутствующие в bundled summary.",
+    )
 
 
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -151,6 +184,7 @@ def _build_top_savings_for_run(
 
 @router.post(
     "/seed",
+    response_model=DemoSeedResponse,
     summary="Заполнить демо-данные",
     description=(
         "Идемпотентно создает/обновляет демо-сценарий и связанные данные для текущего пользователя, "
@@ -162,18 +196,48 @@ def _build_top_savings_for_run(
     },
 )
 def post_demo_seed(
+    body: DemoSeedRequest | None = None,
     db: Session = Depends(get_db),
     current_user: UserRead = Depends(get_current_user),
-) -> dict:
+) -> DemoSeedResponse:
     try:
-        payload = seed_demo_scenario(db, current_user.id)
+        payload = seed_demo_scenario(
+            db,
+            current_user.id,
+            scenario_code=body.scenario_code if body is not None else None,
+        )
     except DemoSeedValidationError as e:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=str(e),
         ) from e
+    except DemoSeedScenarioNotFoundError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        ) from e
     db.commit()
-    return payload
+    return DemoSeedResponse.model_validate(payload)
+
+
+@router.get(
+    "/instances",
+    response_model=list[DemoInstanceSummary],
+    summary="Список доступных demo-инстансов",
+    description=(
+        "Возвращает каталог bundled demo-сценариев из `core/rpml/result_samples`, "
+        "которые можно загрузить через `/api/v1/demo/seed`."
+    ),
+    responses={
+        401: {"description": "Пользователь не аутентифицирован."},
+    },
+)
+def get_demo_instances(
+    db: Session = Depends(get_db),
+    current_user: UserRead = Depends(get_current_user),
+) -> list[DemoInstanceSummary]:
+    _ = db, current_user
+    return [DemoInstanceSummary.model_validate(item) for item in list_bundled_demo_instances()]
 
 
 @router.get(

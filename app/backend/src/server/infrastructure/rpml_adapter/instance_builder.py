@@ -29,15 +29,8 @@ def _loan_bucket(loan_type: str | None) -> int:
     return 3
 
 
-def _require_canonical_debt_order(debts: list[DebtORM]) -> list[DebtORM]:
-    by_id = sorted(debts, key=lambda d: d.id)
-    canonical = sorted(debts, key=lambda d: (_loan_bucket(d.loan_type), d.id))
-    if by_id != canonical:
-        raise OptimizationInstanceError(
-            "Debts are not in canonical order (expected cars, then houses, then credit cards, "
-            "then bank loans; stable by id within each group)."
-        )
-    return by_id
+def _canonicalize_debt_order(debts: list[DebtORM]) -> list[DebtORM]:
+    return sorted(debts, key=lambda d: (_loan_bucket(d.loan_type), d.id))
 
 
 def _count_loan_types(ordered: list[DebtORM]) -> tuple[int, int, int, int]:
@@ -94,11 +87,11 @@ def build_rios_solis_instance(
     *,
     user_id: int,
 ) -> RiosSolisInstance:
-    """Build a solver instance from debt rows and scenario profile (ordered by id)."""
+    """Build a solver instance from debt rows and scenario profile in RPML canonical order."""
     if not debts:
         raise OptimizationInstanceError("No debts to optimize")
 
-    ordered = _require_canonical_debt_order(debts)
+    ordered = _canonicalize_debt_order(debts)
     n = len(ordered)
     t = horizon_months
     for d in ordered:

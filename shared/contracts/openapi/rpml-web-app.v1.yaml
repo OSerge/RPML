@@ -77,21 +77,106 @@ paths:
       description: Идемпотентно создает/обновляет демо-сценарий и связанные данные
         для текущего пользователя, чтобы можно было сразу запускать оптимизацию.
       operationId: post_demo_seed_api_v1_demo_seed_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              anyOf:
+              - $ref: '#/components/schemas/DemoSeedRequest'
+              - type: 'null'
+              title: Body
       responses:
         '200':
           description: Successful Response
           content:
             application/json:
               schema:
-                additionalProperties: true
-                type: object
-                title: Response Post Demo Seed Api V1 Demo Seed Post
+                $ref: '#/components/schemas/DemoSeedResponse'
         '401':
           description: Пользователь не аутентифицирован.
         '422':
           description: Ошибка валидации демо-данных.
       security:
       - HTTPBearer: []
+  /api/v1/demo/instances:
+    get:
+      tags:
+      - demo
+      summary: Список доступных demo-инстансов
+      description: Возвращает каталог bundled demo-сценариев из `core/rpml/result_samples`,
+        которые можно загрузить через `/api/v1/demo/seed`.
+      operationId: get_demo_instances_api_v1_demo_instances_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                items:
+                  $ref: '#/components/schemas/DemoInstanceSummary'
+                type: array
+                title: Response Get Demo Instances Api V1 Demo Instances Get
+        '401':
+          description: Пользователь не аутентифицирован.
+      security:
+      - HTTPBearer: []
+  /api/v1/demo/runs/{run_id}/top-savings:
+    get:
+      tags:
+      - demo
+      summary: Топ инстансов по экономии MILP
+      description: Читает checkpoint эксперимента run и возвращает top-N инстансов
+        по процентной экономии MILP относительно Avalanche или Snowball.
+      operationId: get_demo_run_top_savings_api_v1_demo_runs__run_id__top_savings_get
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: run_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Run Id
+      - name: metric
+        in: query
+        required: false
+        schema:
+          enum:
+          - avalanche
+          - snowball
+          type: string
+          description: Базовая стратегия для сравнения.
+          default: avalanche
+          title: Metric
+        description: Базовая стратегия для сравнения.
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          maximum: 100
+          minimum: 1
+          description: Количество строк в топе.
+          default: 10
+          title: Limit
+        description: Количество строк в топе.
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DemoRunTopSavingsResponse'
+        '401':
+          description: Пользователь не аутентифицирован.
+        '404':
+          description: Run/checkpoint не найден.
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
   /api/v1/debts/loan-types:
     get:
       tags:
@@ -324,6 +409,44 @@ paths:
           description: Ошибка валидации.
       security:
       - HTTPBearer: []
+  /api/v1/optimization/instances:
+    get:
+      tags:
+      - optimization
+      summary: Каталог dataset-инстансов
+      description: Возвращает все доступные `.dat` инстансы из bundled Rios-Solis
+        dataset.
+      operationId: get_dataset_instance_catalog_api_v1_optimization_instances_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatasetInstanceCatalogResponse'
+        '401':
+          description: Пользователь не аутентифицирован.
+      security:
+      - HTTPBearer: []
+  /api/v1/optimization/mc-config/defaults:
+    get:
+      tags:
+      - optimization
+      summary: Дефолтные параметры Monte Carlo
+      description: Возвращает дефолтную конфигурацию модели стохастических траекторий
+        дохода.
+      operationId: get_monte_carlo_defaults_api_v1_optimization_mc_config_defaults_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OptimizationMonteCarloConfig'
+        '401':
+          description: Пользователь не аутентифицирован.
+      security:
+      - HTTPBearer: []
   /api/v1/optimization/run:
     post:
       tags:
@@ -498,12 +621,29 @@ components:
       title: AvailableBudgetEstimateResponse
     CreateOptimizationTaskRequest:
       properties:
+        input_mode:
+          type: string
+          enum:
+          - scenario_snapshot
+          - dataset_instance
+          title: Input Mode
+          description: Источник входных данных для фоновой задачи.
+          default: scenario_snapshot
+        instance_name:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Instance Name
+          description: Имя `.dat` инстанса. Обязательно для `dataset_instance`.
         horizon_months:
-          type: integer
-          maximum: 240.0
-          minimum: 1.0
+          anyOf:
+          - type: integer
+            maximum: 360.0
+            minimum: 1.0
+          - type: 'null'
           title: Horizon Months
-          description: Горизонт планирования в месяцах.
+          description: 'Горизонт планирования. Для dataset mode можно не передавать:
+            будет использован горизонт инстанса.'
         ru_mode:
           type: boolean
           title: Ru Mode
@@ -514,9 +654,12 @@ components:
           title: Mc Income
           description: Если true, в фоне будет рассчитан Monte Carlo summary.
           default: false
+        mc_config:
+          anyOf:
+          - $ref: '#/components/schemas/OptimizationMonteCarloConfig'
+          - type: 'null'
+          description: Параметры Monte Carlo для фонового расчета.
       type: object
-      required:
-      - horizon_months
       title: CreateOptimizationTaskRequest
     CreateOptimizationTaskResponse:
       properties:
@@ -529,6 +672,24 @@ components:
           const: pending
           title: Status
           default: pending
+        input_mode:
+          type: string
+          enum:
+          - scenario_snapshot
+          - dataset_instance
+          title: Input Mode
+          description: Режим входных данных задачи.
+        horizon_months:
+          type: integer
+          title: Horizon Months
+          description: Фактический горизонт задачи.
+        instance_name:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Instance Name
+          description: Имя dataset-инстанса, если задача создана в `dataset_instance`
+            режиме.
         ru_mode:
           type: boolean
           title: Ru Mode
@@ -540,6 +701,8 @@ components:
       type: object
       required:
       - task_id
+      - input_mode
+      - horizon_months
       - ru_mode
       - mc_income
       title: CreateOptimizationTaskResponse
@@ -597,6 +760,61 @@ components:
       - kpis
       - debts
       title: DashboardResponse
+    DatasetInstanceCatalogResponse:
+      properties:
+        total:
+          type: integer
+          title: Total
+          description: Сколько инстансов доступно в каталоге.
+        items:
+          items:
+            $ref: '#/components/schemas/DatasetInstanceSummaryResponse'
+          type: array
+          title: Items
+      type: object
+      required:
+      - total
+      title: DatasetInstanceCatalogResponse
+    DatasetInstanceSummaryResponse:
+      properties:
+        name:
+          type: string
+          title: Name
+          description: Уникальный код dataset-инстанса.
+        loans_count:
+          type: integer
+          title: Loans Count
+          description: Количество долгов в инстансе.
+        horizon_months:
+          type: integer
+          title: Horizon Months
+          description: Горизонт инстанса в месяцах.
+        n_cars:
+          type: integer
+          title: N Cars
+          description: Количество автокредитов.
+        n_houses:
+          type: integer
+          title: N Houses
+          description: Количество ипотек.
+        n_credit_cards:
+          type: integer
+          title: N Credit Cards
+          description: Количество кредитных карт.
+        n_bank_loans:
+          type: integer
+          title: N Bank Loans
+          description: Количество банковских займов.
+      type: object
+      required:
+      - name
+      - loans_count
+      - horizon_months
+      - n_cars
+      - n_houses
+      - n_credit_cards
+      - n_bank_loans
+      title: DatasetInstanceSummaryResponse
     DebtCreate:
       properties:
         name:
@@ -799,6 +1017,136 @@ components:
           description: Новый месяц выдачи (0-indexed).
       type: object
       title: DebtUpdate
+    DemoInstanceSummary:
+      properties:
+        code:
+          type: string
+          title: Code
+          description: Код сценария, который сохраняется в `scenario_profiles.code`.
+        source_file:
+          type: string
+          title: Source File
+          description: Имя bundled JSON-файла в `core/rpml/result_samples`.
+        horizon_months:
+          type: integer
+          title: Horizon Months
+          description: Горизонт сценария в месяцах.
+        loans_count:
+          type: integer
+          title: Loans Count
+          description: Количество долгов в bundled сценарии.
+        has_dat_file:
+          type: boolean
+          title: Has Dat File
+          description: Есть ли рядом исходный `.dat` с реальными ставками.
+        available_baselines:
+          items:
+            type: string
+          type: array
+          title: Available Baselines
+          description: Baseline-стратегии, присутствующие в bundled summary.
+      type: object
+      required:
+      - code
+      - source_file
+      - horizon_months
+      - loans_count
+      - has_dat_file
+      title: DemoInstanceSummary
+    DemoRunTopSavingsItem:
+      properties:
+        instance_name:
+          type: string
+          title: Instance Name
+          description: Имя инстанса из checkpoint.
+        savings_pct:
+          type: number
+          title: Savings Pct
+          description: Экономия MILP vs выбранная baseline-стратегия в процентах.
+        savings_abs:
+          type: number
+          title: Savings Abs
+          description: Абсолютная экономия MILP vs выбранная baseline-стратегия.
+        optimal_cost:
+          type: number
+          title: Optimal Cost
+          description: Стоимость MILP.
+        baseline_cost:
+          type: number
+          title: Baseline Cost
+          description: Стоимость baseline-стратегии.
+        optimal_status:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Optimal Status
+          description: Статус MILP решения для инстанса.
+      type: object
+      required:
+      - instance_name
+      - savings_pct
+      - savings_abs
+      - optimal_cost
+      - baseline_cost
+      title: DemoRunTopSavingsItem
+    DemoRunTopSavingsResponse:
+      properties:
+        run_id:
+          type: string
+          title: Run Id
+        metric:
+          type: string
+          enum:
+          - avalanche
+          - snowball
+          title: Metric
+        checkpoint_path:
+          type: string
+          title: Checkpoint Path
+        total_instances:
+          type: integer
+          title: Total Instances
+        items:
+          items:
+            $ref: '#/components/schemas/DemoRunTopSavingsItem'
+          type: array
+          title: Items
+      type: object
+      required:
+      - run_id
+      - metric
+      - checkpoint_path
+      - total_instances
+      - items
+      title: DemoRunTopSavingsResponse
+    DemoSeedRequest:
+      properties:
+        scenario_code:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Scenario Code
+          description: Код bundled demo-сценария из `/api/v1/demo/instances`. Если
+            не указан, используется стандартный demo-инстанс.
+      type: object
+      title: DemoSeedRequest
+    DemoSeedResponse:
+      properties:
+        ok:
+          type: boolean
+          title: Ok
+        scenario_code:
+          type: string
+          title: Scenario Code
+        debts_count:
+          type: integer
+          title: Debts Count
+      type: object
+      required:
+      - ok
+      - scenario_code
+      - debts_count
+      title: DemoSeedResponse
     HTTPValidationError:
       properties:
         detail:
@@ -826,6 +1174,104 @@ components:
           description: Список поддерживаемых значений loan_type.
       type: object
       title: LoanTypeDirectory
+    OptimizationDebtSummary:
+      properties:
+        id:
+          type: integer
+          title: Id
+          description: Идентификатор долга в рамках результата.
+        name:
+          type: string
+          title: Name
+          description: Читаемое имя долга.
+        loan_type:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Loan Type
+          description: Нормализованный тип кредита, если доступен.
+        principal:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Principal
+          description: Начальная сумма долга.
+        fixed_payment:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Fixed Payment
+          description: Фиксированный или обязательный платеж по долгу.
+        prepay_penalty:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Prepay Penalty
+          description: Штраф за досрочное погашение по профилю долга.
+        default_rate_monthly:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Default Rate Monthly
+          description: Штрафная/default ставка в месяц, если доступна.
+      type: object
+      required:
+      - id
+      - name
+      title: OptimizationDebtSummary
+    OptimizationMonteCarloConfig:
+      properties:
+        n_scenarios:
+          type: integer
+          minimum: 1.0
+          title: N Scenarios
+          description: Количество сценариев Monte Carlo.
+          default: 16
+        seed:
+          type: integer
+          title: Seed
+          description: Базовый seed генератора случайных траекторий.
+          default: 42
+        rho:
+          type: number
+          maximum: 0.999
+          minimum: -0.999
+          title: Rho
+          description: AR(1) коэффициент автокорреляции дохода.
+          default: 0.55
+        sigma:
+          type: number
+          minimum: 0.0
+          title: Sigma
+          description: Волатильность логнормального шума.
+          default: 0.15
+        shock_prob:
+          type: number
+          maximum: 1.0
+          minimum: 0.0
+          title: Shock Prob
+          description: Вероятность шокового снижения дохода в месяце.
+          default: 0.04
+        shock_severity_mean:
+          type: number
+          minimum: 0.0
+          title: Shock Severity Mean
+          description: Средняя глубина шока дохода.
+          default: 0.3
+        shock_severity_std:
+          type: number
+          minimum: 0.0
+          title: Shock Severity Std
+          description: Стандартное отклонение глубины шока дохода.
+          default: 0.1
+        min_income_floor:
+          type: number
+          minimum: 0.0
+          title: Min Income Floor
+          description: Нижняя отсечка месячного дохода.
+          default: 1.0
+      type: object
+      title: OptimizationMonteCarloConfig
     OptimizationPlanResponse:
       properties:
         status:
@@ -836,6 +1282,12 @@ components:
           type: number
           title: Total Cost
           description: Стоимость базового детерминированного плана.
+        debts:
+          items:
+            $ref: '#/components/schemas/OptimizationDebtSummary'
+          type: array
+          title: Debts
+          description: Сводка по долгам, соответствующая строкам матриц аналитики.
         payments_matrix:
           items:
             items:
@@ -844,10 +1296,46 @@ components:
           type: array
           title: Payments Matrix
           description: Матрица платежей [loan][month].
+        balances_matrix:
+          items:
+            items:
+              type: number
+            type: array
+          type: array
+          title: Balances Matrix
+          description: Матрица остатков [loan][month], если доступна для persisted
+            plan.
+        savings_vector:
+          items:
+            type: number
+          type: array
+          title: Savings Vector
+          description: Накопленный резерв/перенос по месяцам.
+        horizon_months:
+          type: integer
+          title: Horizon Months
+          description: Фактический горизонт плана.
+        baseline_comparison:
+          anyOf:
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          title: Baseline Comparison
+          description: Сравнение persisted plan с baseline-стратегиями, если сохранено.
         input_mode:
           type: string
+          enum:
+          - scenario_snapshot
+          - dataset_instance
           title: Input Mode
           default: scenario_snapshot
+        instance_name:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Instance Name
+          description: Имя dataset-инстанса, если план построен в `dataset_instance`
+            режиме.
         assumptions:
           items:
             type: string
@@ -869,22 +1357,59 @@ components:
           - type: 'null'
           title: Mc Summary
           description: Агрегаты Monte Carlo, если расчет выполнялся с `mc_income=true`.
+        mc_config:
+          anyOf:
+          - $ref: '#/components/schemas/OptimizationMonteCarloConfig'
+          - type: 'null'
+          description: Конфигурация Monte Carlo, использованная для расчета.
+        budget_policy:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Budget Policy
+          description: Политика применения месячного бюджета в модели.
+        budget_trace:
+          items:
+            additionalProperties: true
+            type: object
+          type: array
+          title: Budget Trace
+          description: Помесячная трассировка бюджета и резерва.
       type: object
       required:
       - status
       - total_cost
       - payments_matrix
+      - horizon_months
       - ru_mode
       - mc_income
       title: OptimizationPlanResponse
     OptimizationRunRequest:
       properties:
+        input_mode:
+          type: string
+          enum:
+          - scenario_snapshot
+          - dataset_instance
+          title: Input Mode
+          description: 'Источник входных данных: snapshot пользователя или dataset
+            instance.'
+          default: scenario_snapshot
+        instance_name:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Instance Name
+          description: Имя `.dat` инстанса. Обязательно для `dataset_instance`.
         horizon_months:
-          type: integer
-          maximum: 240.0
-          minimum: 1.0
+          anyOf:
+          - type: integer
+            maximum: 360.0
+            minimum: 1.0
+          - type: 'null'
           title: Horizon Months
-          description: Горизонт планирования в месяцах.
+          description: Горизонт планирования в месяцах. Для `scenario_snapshot` обязателен;
+            для `dataset_instance` должен совпадать с горизонтом инстанса, если передан.
         ru_mode:
           type: boolean
           title: Ru Mode
@@ -896,9 +1421,12 @@ components:
           description: Если true, дополнительно рассчитывается Monte Carlo summary
             по траекториям дохода.
           default: false
+        mc_config:
+          anyOf:
+          - $ref: '#/components/schemas/OptimizationMonteCarloConfig'
+          - type: 'null'
+          description: Тонкие параметры Monte Carlo. Используются только при `mc_income=true`.
       type: object
-      required:
-      - horizon_months
       title: OptimizationRunRequest
     OptimizationRunResponse:
       properties:
@@ -910,6 +1438,13 @@ components:
           type: number
           title: Total Cost
           description: Стоимость базового детерминированного плана.
+        debts:
+          items:
+            $ref: '#/components/schemas/OptimizationDebtSummary'
+          type: array
+          title: Debts
+          description: Сводка по долгам, соответствующая строкам матриц платежей и
+            остатков.
         payments_matrix:
           items:
             items:
@@ -944,9 +1479,18 @@ components:
           description: Сравнение MILP-плана с baseline-стратегиями (avalanche/snowball).
         input_mode:
           type: string
-          const: scenario_snapshot
+          enum:
+          - scenario_snapshot
+          - dataset_instance
           title: Input Mode
           default: scenario_snapshot
+        instance_name:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Instance Name
+          description: Имя dataset-инстанса, если расчет выполнен в `dataset_instance`
+            режиме.
         assumptions:
           items:
             type: string
@@ -969,6 +1513,11 @@ components:
           title: Mc Summary
           description: Агрегаты Monte Carlo по стоимости и времени решения (mean/median/p90,
             доля infeasible и т.д.).
+        mc_config:
+          anyOf:
+          - $ref: '#/components/schemas/OptimizationMonteCarloConfig'
+          - type: 'null'
+          description: Конфигурация Monte Carlo, использованная для расчета.
         budget_policy:
           type: string
           title: Budget Policy
@@ -1018,6 +1567,23 @@ components:
           - type: 'null'
           title: Error
           description: Текст ошибки (заполняется при failed).
+        input_mode:
+          type: string
+          enum:
+          - scenario_snapshot
+          - dataset_instance
+          title: Input Mode
+          description: Режим входных данных задачи.
+        horizon_months:
+          type: integer
+          title: Horizon Months
+          description: Горизонт задачи.
+        instance_name:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Instance Name
+          description: Имя dataset-инстанса, если задача считает dataset instance.
         ru_mode:
           type: boolean
           title: Ru Mode
@@ -1030,6 +1596,8 @@ components:
       required:
       - status
       - task_id
+      - input_mode
+      - horizon_months
       - ru_mode
       - mc_income
       title: OptimizationTaskStatusResponse

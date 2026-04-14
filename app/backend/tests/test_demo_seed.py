@@ -58,6 +58,45 @@ def test_demo_seed_is_idempotent(client, auth_headers, db_session, demo_user):
     assert n_profiles == 1
 
 
+def test_demo_instances_catalog_lists_bundled_scenarios(client, auth_headers):
+    res = client.get("/api/v1/demo/instances", headers=auth_headers)
+    assert res.status_code == 200
+    body = res.json()
+    assert isinstance(body, list)
+    codes = [item["code"] for item in body]
+    assert DEMO_SCENARIO_CODE in codes
+    assert "Deudas_4_0_0_0_4_120_fijo_fijo_3" in codes
+    current = next(item for item in body if item["code"] == DEMO_SCENARIO_CODE)
+    assert current["horizon_months"] == 120
+    assert current["loans_count"] == 4
+    assert "milp" in current["available_baselines"]
+
+
+def test_demo_seed_accepts_specific_scenario_code(client, auth_headers, db_session, demo_user):
+    response = client.post(
+        "/api/v1/demo/seed",
+        headers=auth_headers,
+        json={"scenario_code": "Deudas_4_0_0_0_4_120_fijo_fijo_3"},
+    )
+    assert response.status_code == 200
+    assert response.json()["scenario_code"] == "Deudas_4_0_0_0_4_120_fijo_fijo_3"
+
+    profile = db_session.scalars(
+        select(ScenarioProfileORM).where(ScenarioProfileORM.user_id == demo_user.id)
+    ).first()
+    assert profile is not None
+    assert profile.code == "Deudas_4_0_0_0_4_120_fijo_fijo_3"
+
+
+def test_demo_seed_404_on_unknown_scenario_code(client, auth_headers):
+    response = client.post(
+        "/api/v1/demo/seed",
+        headers=auth_headers,
+        json={"scenario_code": "missing_demo_code"},
+    )
+    assert response.status_code == 404
+
+
 def test_demo_seed_scenario_profile_source_and_baseline(client, auth_headers, db_session, demo_user):
     r = client.post("/api/v1/demo/seed", headers=auth_headers)
     assert r.status_code == 200

@@ -20,6 +20,10 @@ class DemoSeedValidationError(ValueError):
     """Invalid seed export JSON (missing keys or inconsistent lengths)."""
 
 
+class DemoSeedScenarioNotFoundError(LookupError):
+    """Requested bundled demo scenario code was not found."""
+
+
 PLACEHOLDER_DEFAULT_RATE_MONTHLY = 0.05
 
 _LOAN_INTEREST_CYCLE: tuple[float, ...] = (
@@ -74,14 +78,53 @@ def default_seed_json_path() -> Path:
     return _repo_root() / "core" / "rpml" / "result_samples" / "Deudas_4_0_0_2_2_120_fijo_fijo_0.json"
 
 
+def _bundled_demo_json_paths() -> list[Path]:
+    samples_dir = _repo_root() / "core" / "rpml" / "result_samples"
+    return sorted(samples_dir.glob("Deudas_*.json"))
+
+
+def _read_seed_file(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    return validate_seed_document(raw)
+
+
+def list_bundled_demo_instances() -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for path in _bundled_demo_json_paths():
+        instance, summary = _read_seed_file(path)
+        code = str(instance["name"])
+        items.append(
+            {
+                "code": code,
+                "source_file": path.name,
+                "horizon_months": int(instance["horizonMonths"]),
+                "loans_count": int(instance["nLoans"]),
+                "has_dat_file": path.with_suffix(".dat").is_file(),
+                "available_baselines": sorted(
+                    key for key in summary.keys() if isinstance(key, str)
+                ),
+            }
+        )
+    items.sort(key=lambda item: str(item["code"]))
+    return items
+
+
+def resolve_seed_json_path(scenario_code: str) -> Path:
+    for item in list_bundled_demo_instances():
+        if item["code"] == scenario_code:
+            return _repo_root() / "core" / "rpml" / "result_samples" / str(item["source_file"])
+    raise DemoSeedScenarioNotFoundError(
+        f"Bundled demo scenario not found: {scenario_code}"
+    )
+
+
 def debt_name_prefix_for_scenario(code: str) -> str:
     """Stable prefix for seeded debt rows (used for idempotent replace without SQL LIKE wildcards)."""
     return f"{code}_loan_"
 
 
 def _bundled_demo_codes() -> set[str]:
-    samples_dir = _repo_root() / "core" / "rpml" / "result_samples"
-    return {path.stem for path in samples_dir.glob("Deudas_*.json")}
+    return {str(item["code"]) for item in list_bundled_demo_instances()}
 
 
 def _legacy_unprefixed_demo_debt_names() -> set[str]:
@@ -271,10 +314,16 @@ def seed_demo_scenario(
     user_id: int,
     *,
     json_path: Path | None = None,
+    scenario_code: str | None = None,
 ) -> dict[str, Any]:
-    path = json_path if json_path is not None else default_seed_json_path()
-    raw = json.loads(path.read_text(encoding="utf-8"))
-    instance, summary = validate_seed_document(raw)
+    path = (
+        json_path
+        if json_path is not None
+        else resolve_seed_json_path(scenario_code)
+        if scenario_code is not None
+        else default_seed_json_path()
+    )
+    instance, summary = _read_seed_file(path)
 
     code: str = str(instance["name"])
     horizon_months: int = int(instance["horizonMonths"])

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 
 import numpy as np
 from sqlalchemy import select
@@ -22,10 +22,18 @@ from server.infrastructure.db.models.scenario_profile import ScenarioProfileORM
 from server.infrastructure.repositories.debt_repository import DebtRepository
 from server.infrastructure.rpml_adapter import RpmlAdapter, build_rios_solis_instance
 from server.infrastructure.rpml_adapter.instance_builder import OptimizationInstanceError
+from server.services.dataset_instances import (
+    DatasetInstanceNotFoundError,
+    load_dataset_instance_by_name,
+)
 
 SCENARIO_INPUT_MODE = "scenario_snapshot"
+DATASET_INPUT_MODE = "dataset_instance"
 SCENARIO_ASSUMPTIONS: tuple[str, ...] = (
     "Loan terms and monthly budget are taken from persisted debts and scenario profile.",
+)
+DATASET_ASSUMPTIONS: tuple[str, ...] = (
+    "Loan terms and monthly budget are loaded from the bundled Rios-Solis dataset instance.",
 )
 
 MVP_INPUT_MODE = SCENARIO_INPUT_MODE
@@ -46,21 +54,99 @@ class OptimizationSolverFailed(Exception):
 class SyncOptimizationResult:
     solver_status: str
     total_cost: float
+    debt_summaries: list[dict]
     payments_matrix: list[list[float]]
     balances_matrix: list[list[float]]
     savings_vector: list[float]
     horizon_months: int
-    scenario_profile_id: int
+    scenario_profile_id: int | None
+    input_mode: str
+    assumptions: list[str]
+    instance_name: str | None
     baseline_comparison: dict
     ru_mode: bool
     mc_income: bool
     mc_summary: dict | None
+    mc_config: IncomeMCConfig | None
     budget_policy: str
     budget_trace: list[dict]
 
 
+@dataclass(frozen=True)
+class OptimizationInputContext:
+    instance: object
+    debt_summaries: tuple[dict, ...]
+    horizon_months: int
+    input_mode: str
+    assumptions: tuple[str, ...]
+    scenario_profile_id: int | None
+    instance_name: str | None
+
+
+def _build_snapshot_debt_summaries(debts) -> tuple[dict, ...]:
+    return tuple(
+        {
+            "id": int(debt.id),
+            "name": str(debt.name or f"Debt {debt.id}"),
+            "loan_type": str(debt.loan_type) if getattr(debt, "loan_type", None) else None,
+            "principal": (
+                float(debt.principal)
+                if getattr(debt, "principal", None) is not None
+                else None
+            ),
+            "fixed_payment": (
+                float(debt.fixed_payment)
+                if getattr(debt, "fixed_payment", None) is not None
+                else None
+            ),
+            "prepay_penalty": (
+                float(debt.prepay_penalty)
+                if getattr(debt, "prepay_penalty", None) is not None
+                else None
+            ),
+            "default_rate_monthly": (
+                float(debt.default_rate_monthly)
+                if getattr(debt, "default_rate_monthly", None) is not None
+                else None
+            ),
+        }
+        for debt in debts
+    )
+
+
+def _build_dataset_debt_summaries(instance) -> tuple[dict, ...]:
+    type_sequence = (
+        [("car_loan", "Автокредит")] * int(instance.n_cars)
+        + [("house_loan", "Ипотека")] * int(instance.n_houses)
+        + [("credit_card", "Кредитная карта")] * int(instance.n_credit_cards)
+        + [("bank_loan", "Банковский кредит")] * int(instance.n_bank_loans)
+    )
+    counters: dict[str, int] = {}
+    rows: list[dict] = []
+    for loan_idx in range(int(instance.n)):
+        loan_type, title = (
+            type_sequence[loan_idx]
+            if loan_idx < len(type_sequence)
+            else ("bank_loan", "Банковский кредит")
+        )
+        counters[loan_type] = counters.get(loan_type, 0) + 1
+        rows.append(
+            {
+                "id": loan_idx + 1,
+                "name": f"{title} {counters[loan_type]}",
+                "loan_type": loan_type,
+                "principal": float(instance.principals[loan_idx]),
+                "fixed_payment": float(instance.fixed_payment[loan_idx]),
+                "prepay_penalty": float(instance.prepay_penalty[loan_idx]),
+                "default_rate_monthly": None,
+            }
+        )
+    return tuple(rows)
+
+
 def _serialize_strategy_result(
     *,
+    instance,
     total_cost: float,
     payments,
     balances,
@@ -73,11 +159,22 @@ def _serialize_strategy_result(
         if savings is not None
         else []
     )
+    implied_penalties_vector = _build_implied_penalties_vector(
+        instance,
+        payments_matrix,
+        balances_matrix,
+    )
     return {
         "total_cost": float(total_cost),
         "payments_matrix": payments_matrix,
         "balances_matrix": balances_matrix,
         "savings_vector": savings_vector,
+        "budget_trace": _build_budget_trace(
+            payments_matrix,
+            instance.monthly_income,
+            savings_vector,
+            implied_penalties_vector,
+        ),
     }
 
 
@@ -208,8 +305,14 @@ def _build_budget_trace(
     return trace
 
 
-def _build_monte_carlo_summary(instance, *, ru_mode: bool) -> dict:
-    base_config = IncomeMCConfig()
+def _build_monte_carlo_summary(
+    instance,
+    *,
+    ru_mode: bool,
+    config: IncomeMCConfig | None = None,
+) -> dict:
+    base_config = config if config is not None else IncomeMCConfig()
+    base_config.validate()
     seeded_config = replace(
         base_config,
         seed=derive_instance_seed(base_config.seed, instance.name),
@@ -271,18 +374,21 @@ def _build_baseline_comparison(
         "savings_vs_snowball_pct": ((sn_total - milp_total_cost) / sn_total * 100.0) if sn_total else 0.0,
         "strategy_results": {
             "milp": _serialize_strategy_result(
+                instance=baseline_instance,
                 total_cost=milp_total_cost,
                 payments=milp_payments,
                 balances=milp_balances,
                 savings=milp_savings,
             ),
             "avalanche": _serialize_strategy_result(
+                instance=baseline_instance,
                 total_cost=av_total,
                 payments=avalanche.payments,
                 balances=avalanche.balances,
                 savings=avalanche.savings,
             ),
             "snowball": _serialize_strategy_result(
+                instance=baseline_instance,
                 total_cost=sn_total,
                 payments=snowball.payments,
                 balances=snowball.balances,
@@ -296,7 +402,7 @@ def _persist_optimization_run(
     db: Session,
     *,
     user_id: int,
-    scenario_profile_id: int,
+    scenario_profile_id: int | None,
     mode: str,
     result_json: dict,
     baseline_comparison_json: dict,
@@ -314,15 +420,12 @@ def _persist_optimization_run(
     db.commit()
 
 
-def execute_run_optimization_sync(
+def _resolve_snapshot_input(
     db: Session,
+    *,
     user_id: int,
     horizon_months: int,
-    *,
-    mode: str = "sync",
-    ru_mode: bool = True,
-    mc_income: bool = False,
-) -> SyncOptimizationResult:
+) -> OptimizationInputContext:
     repo = DebtRepository(db)
     debts = repo.list_for_user(user_id)
     if not debts:
@@ -340,7 +443,88 @@ def execute_run_optimization_sync(
         horizon_months,
         user_id=user_id,
     )
-    instance = with_budget_starts_next_month(raw_instance)
+    return OptimizationInputContext(
+        instance=with_budget_starts_next_month(raw_instance),
+        debt_summaries=_build_snapshot_debt_summaries(debts),
+        horizon_months=horizon_months,
+        input_mode=SCENARIO_INPUT_MODE,
+        assumptions=SCENARIO_ASSUMPTIONS,
+        scenario_profile_id=profile.id,
+        instance_name=None,
+    )
+
+
+def _resolve_dataset_input(
+    *,
+    instance_name: str | None,
+    horizon_months: int | None,
+) -> OptimizationInputContext:
+    if not instance_name:
+        raise OptimizationInstanceError("instance_name is required for dataset_instance mode")
+    try:
+        raw_instance = load_dataset_instance_by_name(instance_name)
+    except DatasetInstanceNotFoundError as exc:
+        raise OptimizationInstanceError(str(exc)) from None
+    resolved_horizon = int(raw_instance.T)
+    if horizon_months is not None and int(horizon_months) != resolved_horizon:
+        raise OptimizationInstanceError(
+            f"horizon_months must match the dataset instance horizon ({resolved_horizon})"
+        )
+    return OptimizationInputContext(
+        instance=with_budget_starts_next_month(raw_instance),
+        debt_summaries=_build_dataset_debt_summaries(raw_instance),
+        horizon_months=resolved_horizon,
+        input_mode=DATASET_INPUT_MODE,
+        assumptions=DATASET_ASSUMPTIONS,
+        scenario_profile_id=None,
+        instance_name=raw_instance.name,
+    )
+
+
+def _resolve_optimization_input(
+    db: Session,
+    *,
+    user_id: int,
+    horizon_months: int | None,
+    input_mode: str,
+    instance_name: str | None,
+) -> OptimizationInputContext:
+    if input_mode == DATASET_INPUT_MODE:
+        return _resolve_dataset_input(
+            instance_name=instance_name,
+            horizon_months=horizon_months,
+        )
+    if horizon_months is None:
+        raise OptimizationInstanceError(
+            "horizon_months is required for scenario_snapshot mode"
+        )
+    return _resolve_snapshot_input(
+        db,
+        user_id=user_id,
+        horizon_months=horizon_months,
+    )
+
+
+def execute_run_optimization_sync(
+    db: Session,
+    user_id: int,
+    horizon_months: int | None,
+    *,
+    mode: str = "sync",
+    input_mode: str = SCENARIO_INPUT_MODE,
+    instance_name: str | None = None,
+    ru_mode: bool = True,
+    mc_income: bool = False,
+    mc_config: IncomeMCConfig | None = None,
+) -> SyncOptimizationResult:
+    input_ctx = _resolve_optimization_input(
+        db,
+        user_id=user_id,
+        horizon_months=horizon_months,
+        input_mode=input_mode,
+        instance_name=instance_name,
+    )
+    instance = input_ctx.instance
     solution = RpmlAdapter().run(instance, ru_mode=ru_mode)
     obj = float(solution.objective_value)
     if not _solution_is_acceptable(solution.status, obj):
@@ -361,7 +545,20 @@ def execute_run_optimization_sync(
         savings_vector,
         ru_mode=ru_mode,
     )
-    mc_summary = _build_monte_carlo_summary(instance, ru_mode=ru_mode) if mc_income else None
+    resolved_mc_config = (
+        mc_config if mc_config is not None else IncomeMCConfig()
+    ) if mc_income else None
+    if resolved_mc_config is not None:
+        resolved_mc_config.validate()
+    mc_summary = (
+        _build_monte_carlo_summary(
+            instance,
+            ru_mode=ru_mode,
+            config=resolved_mc_config,
+        )
+        if mc_income
+        else None
+    )
     budget_trace = _build_budget_trace(
         payments_matrix,
         instance.monthly_income,
@@ -371,21 +568,26 @@ def execute_run_optimization_sync(
     result_json = {
         "status": solution.status,
         "total_cost": obj,
+        "debts": list(input_ctx.debt_summaries),
         "payments_matrix": payments_matrix,
         "balances_matrix": balances_matrix,
         "savings_vector": savings_vector,
-        "horizon_months": horizon_months,
+        "horizon_months": input_ctx.horizon_months,
+        "input_mode": input_ctx.input_mode,
+        "assumptions": list(input_ctx.assumptions),
+        "instance_name": input_ctx.instance_name,
         "ru_mode": ru_mode,
         "mc_income": mc_income,
         "implied_penalties_vector": implied_penalties_vector,
         "mc_summary": mc_summary,
+        "mc_config": asdict(resolved_mc_config) if resolved_mc_config is not None else None,
         "budget_policy": BUDGET_POLICY,
         "budget_trace": budget_trace,
     }
     _persist_optimization_run(
         db,
         user_id=user_id,
-        scenario_profile_id=profile.id,
+        scenario_profile_id=input_ctx.scenario_profile_id,
         mode=mode,
         result_json=result_json,
         baseline_comparison_json=baseline_comparison,
@@ -394,15 +596,20 @@ def execute_run_optimization_sync(
     return SyncOptimizationResult(
         solver_status=solution.status,
         total_cost=obj,
+        debt_summaries=list(input_ctx.debt_summaries),
         payments_matrix=payments_matrix,
         balances_matrix=balances_matrix,
         savings_vector=savings_vector,
-        horizon_months=horizon_months,
-        scenario_profile_id=profile.id,
+        horizon_months=input_ctx.horizon_months,
+        scenario_profile_id=input_ctx.scenario_profile_id,
+        input_mode=input_ctx.input_mode,
+        assumptions=list(input_ctx.assumptions),
+        instance_name=input_ctx.instance_name,
         baseline_comparison=baseline_comparison,
         ru_mode=ru_mode,
         mc_income=mc_income,
         mc_summary=mc_summary,
+        mc_config=resolved_mc_config,
         budget_policy=BUDGET_POLICY,
         budget_trace=budget_trace,
     )

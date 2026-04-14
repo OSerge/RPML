@@ -17,9 +17,9 @@ class OptimizationRunORM(Base):
         nullable=False,
         index=True,
     )
-    scenario_profile_id: Mapped[int] = mapped_column(
+    scenario_profile_id: Mapped[int | None] = mapped_column(
         ForeignKey("scenario_profiles.id", ondelete="CASCADE"),
-        nullable=False,
+        nullable=True,
         index=True,
     )
     mode: Mapped[str] = mapped_column(String(16), nullable=False)
@@ -39,7 +39,7 @@ class OptimizationRunORM(Base):
     )
 
     user: Mapped["UserORM"] = relationship("UserORM", back_populates="optimization_runs")
-    scenario_profile: Mapped["ScenarioProfileORM"] = relationship(
+    scenario_profile: Mapped["ScenarioProfileORM | None"] = relationship(
         "ScenarioProfileORM",
         back_populates="optimization_runs",
     )

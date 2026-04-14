@@ -1,7 +1,15 @@
-from sqlalchemy import select
+from sqlalchemy import case, select
 from sqlalchemy.orm import Session
 
 from server.infrastructure.db.models.debt import DebtORM
+
+_CANONICAL_LOAN_TYPE_ORDER = case(
+    (DebtORM.loan_type == "car_loan", 0),
+    (DebtORM.loan_type == "house_loan", 1),
+    (DebtORM.loan_type == "credit_card", 2),
+    (DebtORM.loan_type == "bank_loan", 3),
+    else_=4,
+)
 
 
 class DebtRepository:
@@ -9,7 +17,12 @@ class DebtRepository:
         self._session = session
 
     def list_for_user(self, user_id: int) -> list[DebtORM]:
-        return list(self._session.scalars(select(DebtORM).where(DebtORM.user_id == user_id)))
+        stmt = (
+            select(DebtORM)
+            .where(DebtORM.user_id == user_id)
+            .order_by(_CANONICAL_LOAN_TYPE_ORDER.asc(), DebtORM.id.asc())
+        )
+        return list(self._session.scalars(stmt))
 
     def get_for_user(self, debt_id: int, user_id: int) -> DebtORM | None:
         row = self._session.get(DebtORM, debt_id)
