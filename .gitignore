@@ -60,4 +60,4 @@ tmp/
 
 reports/
 .worktrees/
-app/frontend/
+app/frontend/node_modules/
